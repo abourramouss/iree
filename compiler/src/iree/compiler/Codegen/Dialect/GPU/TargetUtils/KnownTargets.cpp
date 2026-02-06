@@ -968,6 +968,10 @@ std::optional<TargetDetails> getNVIDIAGPUTargetDetails(StringRef target) {
       .Case("rtx3070ti", TargetDetails{ampereWgp, &rtx3070tiChip})
       // https://www.techpowerup.com/gpu-specs/geforce-rtx-3070.c3674
       .Case("rtx3070", TargetDetails{ampereWgp, &rtx3070Chip})
+      // Hopper and Ada Lovelace (use Ampere WGP as conservative baseline).
+      .Cases({"hopper", "sm_90", "sm_90a"},
+             TargetDetails{ampereWgp, nullptr})
+      .Cases({"ada", "sm_89"}, TargetDetails{ampereWgp, nullptr})
       .Cases({"ampere", "sm_80", "sm_86", "sm_87"},
              TargetDetails{ampereWgp, nullptr})
       .Cases({"turing", "sm_75"}, TargetDetails{turingWgp, nullptr})
@@ -993,6 +997,9 @@ StringRef normalizeNVIDIAGPUTarget(StringRef target) {
   }
 
   return llvm::StringSwitch<StringRef>(target.lower())
+      .Case("hopper", "sm_90")
+      .Case("h100", "sm_90")
+      .Case("ada", "sm_89")
       .Case("a100", "sm_80")
       .Case("ampere", "sm_80") // Or sm_86/87; use smaller version.
       .Case("turing", "sm_75")
