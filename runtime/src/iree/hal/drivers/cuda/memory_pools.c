@@ -49,6 +49,29 @@ static iree_status_t iree_hal_cuda_create_memory_pool(
                             &params.release_threshold),
       "cuMemPoolSetAttribute");
 
+  // Enable peer access on the pool for all other devices that can access this
+  // device. This is required for multi-device execution where buffers allocated
+  // in this pool may be accessed from another device's stream.
+  if (iree_status_is_ok(status)) {
+    int device_count = 0;
+    if (cuda_symbols->cuDeviceGetCount(&device_count) == CUDA_SUCCESS) {
+      for (int j = 0; j < device_count; ++j) {
+        if (j == (int)cu_device) continue;
+        int can_access = 0;
+        if (cuda_symbols->cuDeviceCanAccessPeer(&can_access, j, cu_device) ==
+                CUDA_SUCCESS &&
+            can_access) {
+          CUmemAccessDesc access_desc = {
+              .location = {.type = CU_MEM_LOCATION_TYPE_DEVICE, .id = j},
+              .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+          };
+          // Best-effort: ignore errors for peer pool access.
+          cuda_symbols->cuMemPoolSetAccess(pool, &access_desc, 1);
+        }
+      }
+    }
+  }
+
   if (iree_status_is_ok(status)) {
     *out_pool = pool;
   } else {

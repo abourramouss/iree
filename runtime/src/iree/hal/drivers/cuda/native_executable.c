@@ -29,6 +29,9 @@ typedef struct iree_hal_cuda_native_executable_t {
 
   const iree_hal_cuda_dynamic_symbols_t* symbols;
 
+  // The CUDA context that modules were loaded into.
+  CUcontext cu_context;
+
   // Loaded CUDA modules.
   iree_host_size_t module_count;
   CUmodule* modules;
@@ -238,8 +241,8 @@ static iree_status_t iree_hal_cuda_native_executable_flatbuffer_verify(
 }
 
 iree_status_t iree_hal_cuda_native_executable_create(
-    const iree_hal_cuda_dynamic_symbols_t* symbols, CUdevice device,
-    const iree_hal_executable_params_t* executable_params,
+    const iree_hal_cuda_dynamic_symbols_t* symbols, CUcontext context,
+    CUdevice device, const iree_hal_executable_params_t* executable_params,
     iree_allocator_t host_allocator, iree_hal_executable_t** out_executable) {
   IREE_ASSERT_ARGUMENT(executable_params);
   IREE_ASSERT_ARGUMENT(out_executable);
@@ -301,6 +304,7 @@ iree_status_t iree_hal_cuda_native_executable_create(
                                &executable->resource);
   executable->host_allocator = host_allocator;
   executable->symbols = symbols;
+  executable->cu_context = context;
   executable->module_count = module_count;
   executable->modules =
       (CUmodule*)((uint8_t*)executable + sizeof(*executable) +
@@ -313,6 +317,12 @@ iree_status_t iree_hal_cuda_native_executable_create(
   // Publish any embedded source files to the tracing infrastructure.
   iree_hal_debug_publish_source_files(
       iree_hal_cuda_ExecutableDef_source_files_get(executable_def));
+
+  // Push the owning device context so modules load into the correct context.
+  // Without this, multi-device setups may load modules into whichever context
+  // happens to be current on the calling thread.
+  IREE_CUDA_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, symbols, cuCtxPushCurrent(context), "cuCtxPushCurrent");
 
   // Load each module first so that exports can reference them.
   iree_status_t status = iree_ok_status();
@@ -422,6 +432,10 @@ iree_status_t iree_hal_cuda_native_executable_create(
     }
   }
 
+  // Pop the context we pushed before module loading.
+  CUcontext dummy;
+  symbols->cuCtxPopCurrent(&dummy);
+
   if (iree_status_is_ok(status)) {
     *out_executable = (iree_hal_executable_t*)executable;
   } else {
@@ -439,12 +453,17 @@ static void iree_hal_cuda_native_executable_destroy(
   iree_allocator_t host_allocator = executable->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // Push the owning context so that cuModuleUnload operates on the correct
+  // device context.
+  executable->symbols->cuCtxPushCurrent(executable->cu_context);
   for (iree_host_size_t i = 0; i < executable->module_count; ++i) {
     if (executable->modules[i]) {
       IREE_CUDA_IGNORE_ERROR(executable->symbols,
                              cuModuleUnload(executable->modules[i]));
     }
   }
+  CUcontext dummy;
+  executable->symbols->cuCtxPopCurrent(&dummy);
 
   iree_allocator_free(host_allocator, executable);
 
