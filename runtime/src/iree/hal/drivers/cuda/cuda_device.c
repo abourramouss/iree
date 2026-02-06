@@ -516,6 +516,40 @@ static iree_status_t iree_hal_cuda_device_create_internal(
   return status;
 }
 
+// Enables peer access from the current device context to all other devices
+// that support it. This allows cuMemcpyAsync to work across device contexts,
+// which is required for multi-device execution where buffers allocated on one
+// device may be accessed from another device's stream.
+static iree_status_t iree_hal_cuda_device_enable_peer_access(
+    const iree_hal_cuda_dynamic_symbols_t* symbols, CUdevice device_id) {
+  int device_count = 0;
+  IREE_CUDA_RETURN_IF_ERROR(symbols, cuDeviceGetCount(&device_count),
+                            "cuDeviceGetCount");
+  for (int j = 0; j < device_count; ++j) {
+    if (j == (int)device_id) continue;
+    int can_access = 0;
+    CUresult result = symbols->cuDeviceCanAccessPeer(&can_access, device_id, j);
+    if (result != CUDA_SUCCESS || !can_access) continue;
+    CUdevice peer_device;
+    result = symbols->cuDeviceGet(&peer_device, j);
+    if (result != CUDA_SUCCESS) continue;
+    CUcontext peer_context = NULL;
+    result = symbols->cuDevicePrimaryCtxRetain(&peer_context, peer_device);
+    if (result != CUDA_SUCCESS) continue;
+    result = symbols->cuCtxEnablePeerAccess(peer_context, 0);
+    if (result != CUDA_SUCCESS &&
+        result != CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED) {
+      symbols->cuDevicePrimaryCtxRelease(peer_device);
+      return iree_hal_cuda_result_to_status(symbols, result, __FILE__,
+                                            __LINE__);
+    }
+    // Release the retain we did — the primary context stays alive as long as
+    // the peer device retains it elsewhere.
+    symbols->cuDevicePrimaryCtxRelease(peer_device);
+  }
+  return iree_ok_status();
+}
+
 iree_status_t iree_hal_cuda_device_create(
     iree_hal_driver_t* driver, iree_string_view_t identifier,
     const iree_hal_cuda_device_params_t* params,
@@ -538,6 +572,12 @@ iree_status_t iree_hal_cuda_device_create(
   }
   if (iree_status_is_ok(status)) {
     status = IREE_CURESULT_TO_STATUS(cuda_symbols, cuCtxSetCurrent(context));
+  }
+
+  // Enable peer access to all other devices so that cross-device memory
+  // operations work (e.g., cuMemcpyAsync between device contexts).
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_cuda_device_enable_peer_access(cuda_symbols, device);
   }
 
   // Create the default dispatch stream for the device.
@@ -890,7 +930,7 @@ static iree_status_t iree_hal_cuda_device_create_executable_cache(
     iree_loop_t loop, iree_hal_executable_cache_t** out_executable_cache) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   return iree_hal_cuda_nop_executable_cache_create(
-      identifier, device->cuda_symbols, device->cu_device,
+      identifier, device->cuda_symbols, device->cu_context, device->cu_device,
       device->host_allocator, out_executable_cache);
 }
 

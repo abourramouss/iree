@@ -22,6 +22,7 @@ typedef struct iree_hal_cuda_nop_executable_cache_t {
 
   const iree_hal_cuda_dynamic_symbols_t* symbols;
 
+  CUcontext context;
   CUdevice device;
 } iree_hal_cuda_nop_executable_cache_t;
 
@@ -37,8 +38,8 @@ iree_hal_cuda_nop_executable_cache_cast(
 
 iree_status_t iree_hal_cuda_nop_executable_cache_create(
     iree_string_view_t identifier,
-    const iree_hal_cuda_dynamic_symbols_t* symbols, CUdevice device,
-    iree_allocator_t host_allocator,
+    const iree_hal_cuda_dynamic_symbols_t* symbols, CUcontext context,
+    CUdevice device, iree_allocator_t host_allocator,
     iree_hal_executable_cache_t** out_executable_cache) {
   IREE_ASSERT_ARGUMENT(out_executable_cache);
   IREE_TRACE_ZONE_BEGIN(z0);
@@ -53,6 +54,7 @@ iree_status_t iree_hal_cuda_nop_executable_cache_create(
                                &executable_cache->resource);
   executable_cache->host_allocator = host_allocator;
   executable_cache->symbols = symbols;
+  executable_cache->context = context;
   executable_cache->device = device;
 
   *out_executable_cache = (iree_hal_executable_cache_t*)executable_cache;
@@ -102,7 +104,8 @@ static iree_status_t iree_hal_cuda_nop_executable_cache_prepare_executable(
   iree_hal_cuda_nop_executable_cache_t* executable_cache =
       iree_hal_cuda_nop_executable_cache_cast(base_executable_cache);
   return iree_hal_cuda_native_executable_create(
-      executable_cache->symbols, executable_cache->device, executable_params,
+      executable_cache->symbols, executable_cache->context,
+      executable_cache->device, executable_params,
       executable_cache->host_allocator, out_executable);
 }
 

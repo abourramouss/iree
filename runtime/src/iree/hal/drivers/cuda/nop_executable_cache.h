@@ -21,8 +21,8 @@ extern "C" {
 // behavior.
 iree_status_t iree_hal_cuda_nop_executable_cache_create(
     iree_string_view_t identifier,
-    const iree_hal_cuda_dynamic_symbols_t* symbols, CUdevice device,
-    iree_allocator_t host_allocator,
+    const iree_hal_cuda_dynamic_symbols_t* symbols, CUcontext context,
+    CUdevice device, iree_allocator_t host_allocator,
     iree_hal_executable_cache_t** out_executable_cache);
 
 #ifdef __cplusplus

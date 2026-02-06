@@ -56,8 +56,8 @@ iree_status_t iree_hal_cuda_native_executable_infer_format(
 // Creates an IREE executable from a CUDA PTX module. The module may contain
 // several kernels that can be extracted along with the associated block size.
 iree_status_t iree_hal_cuda_native_executable_create(
-    const iree_hal_cuda_dynamic_symbols_t* symbols, CUdevice device,
-    const iree_hal_executable_params_t* executable_params,
+    const iree_hal_cuda_dynamic_symbols_t* symbols, CUcontext context,
+    CUdevice device, const iree_hal_executable_params_t* executable_params,
     iree_allocator_t host_allocator, iree_hal_executable_t** out_executable);
 
 // Returns the kernel launch information for the given |entry_point| in the
