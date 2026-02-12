@@ -29,6 +29,10 @@ typedef struct iree_hal_cuda_allocator_t {
   // The device that this allocator allocates memory from.
   CUdevice device;
 
+  // The CUDA context for this device. Must be set current before CUDA API
+  // calls that are context-dependent (cuMemAlloc, cuMemHostRegister, etc).
+  CUcontext cu_context;
+
   // The CUDA stream that allocations should be used in.
   CUstream stream;
 
@@ -61,8 +65,9 @@ static iree_hal_cuda_allocator_t* iree_hal_cuda_allocator_cast(
 iree_status_t iree_hal_cuda_allocator_create(
     iree_hal_device_t* parent_device,
     const iree_hal_cuda_dynamic_symbols_t* cuda_symbols, CUdevice device,
-    CUstream stream, iree_hal_cuda_memory_pools_t* pools,
-    iree_allocator_t host_allocator, iree_hal_allocator_t** out_allocator) {
+    CUcontext cu_context, CUstream stream,
+    iree_hal_cuda_memory_pools_t* pools, iree_allocator_t host_allocator,
+    iree_hal_allocator_t** out_allocator) {
   IREE_ASSERT_ARGUMENT(parent_device);
   IREE_ASSERT_ARGUMENT(cuda_symbols);
   IREE_ASSERT_ARGUMENT(out_allocator);
@@ -112,6 +117,7 @@ iree_status_t iree_hal_cuda_allocator_create(
                                &allocator->resource);
   allocator->parent_device = parent_device;
   allocator->device = device;
+  allocator->cu_context = cu_context;
   allocator->stream = stream;
   allocator->pools = pools;
   allocator->symbols = cuda_symbols;
@@ -379,6 +385,14 @@ static iree_status_t iree_hal_cuda_allocator_allocate_buffer(
 #endif  // IREE_STATUS_MODE
   }
 
+  // Ensure the correct CUDA context is current for this allocator's device.
+  // Without this, cuMemAlloc/cuMemAllocManaged/cuMemHostAlloc would use
+  // whatever context happens to be current on the calling thread, which in
+  // multi-device scenarios may belong to a different device.
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      allocator->symbols, cuCtxSetCurrent(allocator->cu_context),
+      "cuCtxSetCurrent"));
+
   iree_status_t status = iree_ok_status();
   iree_hal_cuda_buffer_type_t buffer_type = IREE_HAL_CUDA_BUFFER_TYPE_DEVICE;
   void* host_ptr = NULL;
@@ -476,12 +490,7 @@ static void iree_hal_cuda_allocator_deallocate_buffer(
       iree_hal_cuda_buffer_type(base_buffer);
 
   // WARNING: we may be called from a random thread and need to ensure that we
-  // have an active CUDA context. Unfortunately CUDA is CUDA and trying to
-  // change the context here will result in full device synchronization. In the
-  // future we'll need to do something fairly complex such as having a dedicated
-  // thread with a persistently bound context that does nothing but free
-  // buffers. The load on this will be lighter when queue-ordered allocations
-  // are used or any sort of pooling policy is applied.
+  // have an active CUDA context. Set it here to ensure correct device context.
   //
   // WARNING: with CUDA's lazy error propagation it's possible that by the time
   // this code is running something else has triggered device loss and we can't
@@ -489,6 +498,7 @@ static void iree_hal_cuda_allocator_deallocate_buffer(
   // to silently ignore them: whatever the user tries to do next will fail in
   // the same way and if we were deallocating this buffer as part of a tear-down
   // on failure we don't want to end up dying during cleanup.
+  allocator->symbols->cuCtxSetCurrent(allocator->cu_context);
   iree_hal_cuda_buffer_free(allocator->symbols, buffer_type,
                             iree_hal_cuda_buffer_device_pointer(base_buffer),
                             iree_hal_cuda_buffer_host_pointer(base_buffer));
@@ -580,6 +590,11 @@ static iree_status_t iree_hal_cuda_allocator_import_buffer(
         "allocator cannot import a buffer with the given parameters");
 #endif  // IREE_STATUS_MODE
   }
+
+  // Ensure the correct CUDA context is current for this allocator's device.
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      allocator->symbols, cuCtxSetCurrent(allocator->cu_context),
+      "cuCtxSetCurrent"));
 
   iree_status_t status = iree_ok_status();
   iree_hal_cuda_buffer_type_t buffer_type = IREE_HAL_CUDA_BUFFER_TYPE_DEVICE;

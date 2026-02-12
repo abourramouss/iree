@@ -1126,6 +1126,7 @@ iree_hal_deferred_work_queue_execution_device_signal_host_callback(
       (iree_hal_deferred_work_queue_action_t*)user_data;
   IREE_ASSERT_LE(action->kind, IREE_HAL_QUEUE_ACTION_TYPE_QUEUE_MAX);
   IREE_ASSERT_EQ(action->state, IREE_HAL_QUEUE_ACTION_STATE_ALIVE);
+
   if (IREE_UNLIKELY(!iree_status_is_ok(status))) {
     iree_hal_deferred_work_queue_action_fail(action, status);
     IREE_TRACE_ZONE_END(z0);
@@ -1252,10 +1253,18 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
                 action->signal_semaphore_list.payload_values[i], &event));
 
     // Record the event signaling in the dispatch stream.
-    IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0,
-        device_interface->vtable->record_native_event(device_interface, event));
-    completion_event = event;
+    // NOTE: This may fail in cross-device scenarios where the event was created
+    // in a different device context than the dispatch stream (e.g., CUDA events
+    // are context-specific and cannot be recorded on a foreign stream). In that
+    // case we fall through to create a local completion event from the issuing
+    // device and rely on host-side semaphore signaling in the callback.
+    iree_status_t record_status =
+        device_interface->vtable->record_native_event(device_interface, event);
+    if (iree_status_is_ok(record_status)) {
+      completion_event = event;
+    } else {
+      iree_status_ignore(record_status);
+    }
   }
 
   bool created_event = false;
