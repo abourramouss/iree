@@ -503,7 +503,8 @@ static iree_status_t iree_hal_cuda_device_create_internal(
 
   if (iree_status_is_ok(status)) {
     status = iree_hal_cuda_allocator_create(
-        (iree_hal_device_t*)device, cuda_symbols, cu_device, dispatch_stream,
+        (iree_hal_device_t*)device, cuda_symbols, cu_device, context,
+        dispatch_stream,
         device->supports_memory_pools ? &device->memory_pools : NULL,
         host_allocator, &device->device_allocator);
   }
@@ -973,6 +974,11 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
 
+  // Ensure the correct CUDA context is current for this device.
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
+      "cuCtxSetCurrent"));
+
   // NOTE: block on the semaphores here; we could avoid this by properly
   // sequencing device work with semaphores. The CUDA HAL is not currently
   // asynchronous.
@@ -1015,6 +1021,11 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
+
+  // Ensure the correct CUDA context is current for this device.
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
+      "cuCtxSetCurrent"));
 
   // NOTE: block on the semaphores here; we could avoid this by properly
   // sequencing device work with semaphores. The CUDA HAL is not currently

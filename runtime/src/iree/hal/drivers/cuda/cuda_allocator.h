@@ -24,8 +24,9 @@ extern "C" {
 iree_status_t iree_hal_cuda_allocator_create(
     iree_hal_device_t* parent_device,
     const iree_hal_cuda_dynamic_symbols_t* cuda_symbols, CUdevice device,
-    CUstream stream, iree_hal_cuda_memory_pools_t* pools,
-    iree_allocator_t host_allocator, iree_hal_allocator_t** out_allocator);
+    CUcontext cu_context, CUstream stream,
+    iree_hal_cuda_memory_pools_t* pools, iree_allocator_t host_allocator,
+    iree_hal_allocator_t** out_allocator);
 
 #ifdef __cplusplus
 }  // extern "C"
