@@ -22,6 +22,50 @@ def AnnotateDispatchesPass :
   let summary = "Annotates executable dispatches based on their contents.";
 }
 
+def AssignDeviceAffinityPass :
+    Pass<"iree-flow-assign-device-affinity", "mlir::ModuleOp"> {
+  let summary = "Assigns device affinity to flow.dispatch ops using a device map.";
+  let description = [{
+    Assigns `#hal.device.affinity<@__device_N>` to flow.dispatch ops based on
+    a device map. The map is a comma-separated list of `device_id:start-end`
+    entries where start and end are inclusive dispatch ordinals.
+
+    Example: `device-map="0:0-15,1:16-24,2:25-31"` assigns dispatches 0-15
+    to device 0, dispatches 16-24 to device 1, and dispatches 25-31 to device 2.
+
+    Ranges must cover all dispatches without gaps or overlaps.
+  }];
+  let dependentDialects = [
+    "IREE::HAL::HALDialect",
+  ];
+  let options = [
+    Option<"deviceMap", "device-map", "std::string",
+           /*default=*/"\"\"",
+           "Comma-separated device_id:start-end entries mapping dispatch ranges to devices.">
+  ];
+}
+
+def DynamicDevicePlacementPass :
+    Pass<"iree-flow-dynamic-device-placement", "mlir::ModuleOp"> {
+  let summary = "Wraps flow.dispatch ops in scf.if gates for runtime device placement.";
+  let description = [{
+    Adds a placement tensor input (tensor<Nxi32>) to entry functions and wraps
+    each flow.dispatch in scf.if/else with device 0/1 affinities. At runtime,
+    placement[i]==0 sends dispatch i to device 0, otherwise device 1.
+
+    No recompilation needed to change the split point -- just pass a different
+    placement array.
+
+    Use with: --iree-hal-target-device=cuda[0] --iree-hal-target-device=cuda[1]
+  }];
+  let dependentDialects = [
+    "IREE::HAL::HALDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::tensor::TensorDialect",
+  ];
+}
+
 def CanonicalizePass :
     Pass<"iree-flow-canonicalize", ""> {
   let summary = "Flow specific canonicalization pass";
