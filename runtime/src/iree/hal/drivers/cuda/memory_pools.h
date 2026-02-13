@@ -73,6 +73,19 @@ iree_status_t iree_hal_cuda_memory_pools_dealloca(
     iree_hal_cuda_memory_pools_t* pools, CUstream stream,
     iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags);
 
+// Tracks pool allocation statistics.
+void iree_hal_cuda_memory_pool_track_alloc(
+    iree_hal_cuda_memory_pools_t* pools, iree_hal_buffer_t* buffer);
+
+// Tracks pool deallocation statistics.
+void iree_hal_cuda_memory_pool_track_free(
+    iree_hal_cuda_memory_pools_t* pools, iree_hal_buffer_t* buffer);
+
+// Release callback for async pool buffers. Passed as user_data when wrapping
+// async buffers.
+void iree_hal_cuda_memory_pools_async_buffer_release_callback(
+    void* user_data, iree_hal_buffer_t* buffer);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

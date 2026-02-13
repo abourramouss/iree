@@ -42,6 +42,10 @@ iree_status_t iree_hal_cuda_buffer_wrap(
     void* host_ptr, iree_hal_buffer_release_callback_t release_callback,
     iree_allocator_t host_allocator, iree_hal_buffer_t** out_buffer);
 
+// Returns true if |buffer| is a CUDA buffer (as opposed to a foreign buffer
+// from another HAL driver like local-task).
+bool iree_hal_cuda_buffer_isa(const iree_hal_buffer_t* buffer);
+
 // Returns the underlying CUDA buffer type of the given |buffer|.
 iree_hal_cuda_buffer_type_t iree_hal_cuda_buffer_type(
     const iree_hal_buffer_t* buffer);
@@ -55,6 +59,15 @@ CUdeviceptr iree_hal_cuda_buffer_device_pointer(
 
 // Returns the CUDA host pointer for the given |buffer|, if available.
 void* iree_hal_cuda_buffer_host_pointer(const iree_hal_buffer_t* buffer);
+
+// Sets the device pointer on an existing buffer.
+// Used for deferred async allocations where the buffer object is created first
+// and the device memory is allocated later.
+void iree_hal_cuda_buffer_set_device_pointer(iree_hal_buffer_t* buffer,
+                                              CUdeviceptr device_ptr);
+
+// Clears the device pointer, marking the buffer as empty/unallocated.
+void iree_hal_cuda_buffer_set_allocation_empty(iree_hal_buffer_t* buffer);
 
 // Drops the release callback so that when the buffer is destroyed no callback
 // will be made. This is not thread safe but all callers are expected to be

@@ -161,10 +161,26 @@ void* iree_hal_cuda_buffer_host_pointer(const iree_hal_buffer_t* base_buffer) {
   return buffer->host_ptr;
 }
 
+void iree_hal_cuda_buffer_set_device_pointer(iree_hal_buffer_t* base_buffer,
+                                              CUdeviceptr device_ptr) {
+  iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
+  buffer->device_ptr = device_ptr;
+}
+
+void iree_hal_cuda_buffer_set_allocation_empty(
+    iree_hal_buffer_t* base_buffer) {
+  iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
+  buffer->device_ptr = 0;
+}
+
 void iree_hal_cuda_buffer_drop_release_callback(
     iree_hal_buffer_t* base_buffer) {
   iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
   buffer->release_callback = iree_hal_buffer_release_callback_null();
+}
+
+bool iree_hal_cuda_buffer_isa(const iree_hal_buffer_t* buffer) {
+  return iree_hal_resource_is(buffer, &iree_hal_cuda_buffer_vtable);
 }
 
 static const iree_hal_buffer_vtable_t iree_hal_cuda_buffer_vtable = {

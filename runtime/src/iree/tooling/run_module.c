@@ -6,6 +6,7 @@
 
 #include "iree/tooling/run_module.h"
 
+#include <stdio.h>
 #include "iree/base/api.h"
 #include "iree/base/internal/flags.h"
 #include "iree/hal/api.h"
@@ -249,20 +250,30 @@ static iree_status_t iree_tooling_run_function(
 
   // Invoke the function with the provided inputs.
   if (iree_status_is_ok(status)) {
+    fprintf(stderr, "[RUN] invoking function...\n");
     status = iree_status_annotate_f(
         iree_vm_invoke(context, function, IREE_VM_INVOCATION_FLAG_NONE,
                        /*policy=*/NULL, inputs, outputs, host_allocator),
         "invoking function '%.*s'", (int)function_name.size,
         function_name.data);
+    fprintf(stderr, "[RUN] invoke done, status_code=%d\n",
+            (int)iree_status_code(status));
   }
   iree_vm_list_release(inputs);
 
   // If the function is async we need to wait for it to complete.
   if (iree_status_is_ok(status) && finish_fence) {
-    IREE_RETURN_IF_ERROR(
+    fprintf(stderr, "[RUN] waiting on finish fence...\n");
+    iree_status_t fence_status =
         iree_hal_fence_wait(finish_fence, iree_infinite_timeout(),
-                            IREE_HAL_WAIT_FLAG_DEFAULT),
-        "waiting on finish fence");
+                            IREE_HAL_WAIT_FLAG_DEFAULT);
+    fprintf(stderr, "[RUN] fence wait done, status_code=%d\n",
+            (int)iree_status_code(fence_status));
+    if (!iree_status_is_ok(fence_status)) {
+      iree_hal_fence_release(finish_fence);
+      return iree_status_annotate(fence_status,
+                                  iree_make_cstring_view("waiting on finish fence"));
+    }
   }
   iree_hal_fence_release(finish_fence);
 
@@ -270,6 +281,8 @@ static iree_status_t iree_tooling_run_function(
   if (iree_status_is_ok(status)) {
     status = iree_status_annotate_f(iree_hal_end_profiling_from_flags(device),
                                     "ending device profiling");
+    fprintf(stderr, "[RUN] end_profiling status_code=%d\n",
+            (int)iree_status_code(status));
   }
 
   // Grab any instrumentation data present in the context and write it to disk.
@@ -277,11 +290,14 @@ static iree_status_t iree_tooling_run_function(
     status = iree_status_annotate_f(
         iree_tooling_process_instrument_data(context, host_allocator),
         "processing instrument data");
+    fprintf(stderr, "[RUN] instrument_data status_code=%d\n",
+            (int)iree_status_code(status));
   }
 
   // Transfer outputs to the host so they can be processed. Only required when
   // using full HAL device-based execution.
   if (iree_status_is_ok(status) && device != NULL) {
+    fprintf(stderr, "[RUN] transferring outputs to host...\n");
     iree_hal_buffer_params_t target_params = {
         .usage = IREE_HAL_BUFFER_USAGE_TRANSFER | IREE_HAL_BUFFER_USAGE_MAPPING,
         .access = IREE_HAL_MEMORY_ACCESS_ALL,
@@ -293,6 +309,8 @@ static iree_status_t iree_tooling_run_function(
     status = iree_tooling_transfer_variants(
         outputs, device, device_allocator, target_params,
         /*wait_fence=*/NULL, /*signal_fence=*/NULL);
+    fprintf(stderr, "[RUN] transfer status_code=%d\n",
+            (int)iree_status_code(status));
   }
 
   // Wrap stdout for printing results.
@@ -303,6 +321,8 @@ static iree_status_t iree_tooling_run_function(
                                   /*owns_handle=*/false, host_allocator,
                                   &stdout_stream),
         "opening stdout stream");
+    fprintf(stderr, "[RUN] stdout_stream status_code=%d\n",
+            (int)iree_status_code(status));
   }
 
   // Handle either printing/writing the outputs or checking them against
@@ -313,6 +333,8 @@ static iree_status_t iree_tooling_run_function(
                                      stdout_stream, host_allocator,
                                      out_exit_code),
         "processing function outputs");
+    fprintf(stderr, "[RUN] process_results status_code=%d\n",
+            (int)iree_status_code(status));
   }
   iree_vm_list_release(outputs);
 
