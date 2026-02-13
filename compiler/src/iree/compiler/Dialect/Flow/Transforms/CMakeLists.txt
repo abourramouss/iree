@@ -30,6 +30,8 @@ iree_cc_library(
     "RegionOpUtils.h"
   SRCS
     "AnnotateDispatches.cpp"
+    "AssignDeviceAffinity.cpp"
+    "DynamicDevicePlacement.cpp"
     "Canonicalize.cpp"
     "CaptureDynamicDims.cpp"
     "CleanupTensorShapes.cpp"
