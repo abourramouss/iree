@@ -7,6 +7,7 @@
 #include "iree/hal/drivers/local_task/task_queue.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/hal/drivers/local_task/task_command_buffer.h"
@@ -124,12 +125,35 @@ static iree_status_t iree_hal_task_queue_wait_cmd(
   iree_hal_task_queue_wait_cmd_t* cmd = (iree_hal_task_queue_wait_cmd_t*)task;
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  fprintf(stderr, "[TASK] wait_cmd: wait_count=%zu\n", cmd->wait_semaphores.count);
   iree_status_t status = iree_ok_status();
   for (iree_host_size_t i = 0; i < cmd->wait_semaphores.count; ++i) {
-    status = iree_hal_task_semaphore_enqueue_timepoint(
-        cmd->wait_semaphores.semaphores[i],
-        cmd->wait_semaphores.payload_values[i],
-        cmd->task.header.completion_task, cmd->arena, pending_submission);
+    bool is_native = iree_hal_task_semaphore_isa(cmd->wait_semaphores.semaphores[i]);
+    fprintf(stderr, "[TASK]   wait[%zu]: is_task=%d value=%lu\n", i,
+            is_native, (unsigned long)cmd->wait_semaphores.payload_values[i]);
+    if (is_native) {
+      // Native task semaphore: use the efficient enqueue_timepoint path.
+      status = iree_hal_task_semaphore_enqueue_timepoint(
+          cmd->wait_semaphores.semaphores[i],
+          cmd->wait_semaphores.payload_values[i],
+          cmd->task.header.completion_task, cmd->arena, pending_submission);
+    } else {
+      // Foreign semaphore (e.g. CUDA): use the generic vtable wait.
+      // This blocks the worker thread but is correct for cross-device deps.
+      fprintf(stderr, "[TASK]   pre-waiting foreign sem[%zu]...\n", i);
+      // First query the current value.
+      uint64_t cur_val = 0;
+      iree_hal_semaphore_query(cmd->wait_semaphores.semaphores[i], &cur_val);
+      fprintf(stderr, "[TASK]   foreign sem current_value=%lu target=%lu\n",
+              (unsigned long)cur_val,
+              (unsigned long)cmd->wait_semaphores.payload_values[i]);
+      status = iree_hal_semaphore_wait(
+          cmd->wait_semaphores.semaphores[i],
+          cmd->wait_semaphores.payload_values[i], iree_infinite_timeout(),
+          IREE_HAL_WAIT_FLAG_DEFAULT);
+      fprintf(stderr, "[TASK]   pre-wait done sem[%zu] status_code=%d\n", i,
+              (int)iree_status_code(status));
+    }
     if (IREE_UNLIKELY(!iree_status_is_ok(status))) break;
   }
 
@@ -464,7 +488,16 @@ static iree_status_t iree_hal_task_queue_retire_cmd(
   // Signal all semaphores to their new values.
   // Note that if any signal fails then the whole command will fail and all
   // semaphores will be signaled to the failure state.
+  fprintf(stderr, "[TASK] retire_cmd: signaling %zu semaphores\n",
+          cmd->signal_semaphores.count);
+  for (iree_host_size_t i = 0; i < cmd->signal_semaphores.count; ++i) {
+    fprintf(stderr, "[TASK]   signal[%zu]: sem=%p value=%lu\n", i,
+            (void*)cmd->signal_semaphores.semaphores[i],
+            (unsigned long)cmd->signal_semaphores.payload_values[i]);
+  }
   iree_status_t status = iree_hal_semaphore_list_signal(cmd->signal_semaphores);
+  fprintf(stderr, "[TASK] retire_cmd: signal done status_code=%d\n",
+          (int)iree_status_code(status));
 
   IREE_TRACE_ZONE_END(z0);
   return status;

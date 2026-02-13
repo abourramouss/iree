@@ -6,6 +6,8 @@
 
 #include "iree/hal/drivers/cuda/stream_command_buffer.h"
 
+#include <stdio.h>
+
 #include "iree/hal/drivers/cuda/cuda_buffer.h"
 #include "iree/hal/drivers/cuda/cuda_status_util.h"
 #include "iree/hal/drivers/cuda/native_executable.h"
@@ -41,6 +43,119 @@ typedef struct iree_hal_cuda_stream_command_buffer_t {
 
 static const iree_hal_command_buffer_vtable_t
     iree_hal_cuda_stream_command_buffer_vtable;
+
+// Resolves the CUdeviceptr for a buffer, handling both native CUDA buffers
+// and foreign buffers (e.g. from local-task) by importing them on-the-fly
+// via cuMemHostRegister. The imported registration is tracked in the
+// command buffer's resource_set so it lives until the command completes.
+//
+// For native CUDA buffers this just returns the device pointer directly.
+// For foreign buffers, we map them to get the host pointer, register with
+// CUDA, and create a wrapper buffer that unregisters on release.
+typedef struct iree_hal_cuda_stream_imported_buffer_info_t {
+  const iree_hal_cuda_dynamic_symbols_t* cuda_symbols;
+  void* host_ptr;
+} iree_hal_cuda_stream_imported_buffer_info_t;
+
+static void iree_hal_cuda_stream_imported_buffer_release(
+    void* user_data, iree_hal_buffer_t* buffer) {
+  iree_hal_cuda_stream_imported_buffer_info_t* info =
+      (iree_hal_cuda_stream_imported_buffer_info_t*)user_data;
+  if (info->host_ptr) {
+    IREE_CUDA_IGNORE_ERROR(info->cuda_symbols,
+                           cuMemHostUnregister(info->host_ptr));
+  }
+  iree_allocator_free(iree_allocator_system(), info);
+}
+
+static iree_status_t iree_hal_cuda_stream_resolve_buffer_device_pointer(
+    iree_hal_cuda_stream_command_buffer_t* command_buffer,
+    iree_hal_buffer_t* buffer, CUdeviceptr* out_device_ptr) {
+  iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+  if (iree_hal_cuda_buffer_isa(allocated)) {
+    // Native CUDA buffer - direct access.
+    *out_device_ptr = iree_hal_cuda_buffer_device_pointer(allocated);
+    return iree_ok_status();
+  }
+
+  // Foreign buffer: map, register, wrap.
+  iree_device_size_t alloc_size = iree_hal_buffer_allocation_size(allocated);
+  fprintf(stderr,
+          "[CUDA-CMD] importing foreign buffer %p alloc_size=%zu\n",
+          (void*)allocated, (size_t)alloc_size);
+
+  iree_hal_buffer_mapping_t mapping;
+  iree_status_t status = iree_hal_buffer_map_range(
+      allocated, IREE_HAL_MAPPING_MODE_PERSISTENT,
+      IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, 0,
+      alloc_size, &mapping);
+  if (!iree_status_is_ok(status)) {
+    status = iree_hal_buffer_map_range(allocated,
+                                       IREE_HAL_MAPPING_MODE_PERSISTENT,
+                                       IREE_HAL_MEMORY_ACCESS_READ, 0,
+                                       alloc_size, &mapping);
+  }
+  if (!iree_status_is_ok(status)) return status;
+
+  void* host_ptr = mapping.contents.data;
+  iree_hal_buffer_unmap_range(&mapping);
+
+  CUdeviceptr device_ptr = 0;
+  status = IREE_CURESULT_TO_STATUS(
+      command_buffer->cuda_symbols,
+      cuMemHostRegister(host_ptr, (size_t)alloc_size,
+                        CU_MEMHOSTREGISTER_DEVICEMAP),
+      "cuMemHostRegister");
+  if (iree_status_is_ok(status)) {
+    status = IREE_CURESULT_TO_STATUS(
+        command_buffer->cuda_symbols,
+        cuMemHostGetDevicePointer(&device_ptr, host_ptr, 0),
+        "cuMemHostGetDevicePointer");
+  }
+  if (!iree_status_is_ok(status)) return status;
+
+  fprintf(stderr, "[CUDA-CMD] registered host=%p device=0x%llx\n",
+          host_ptr, (unsigned long long)device_ptr);
+
+  // Create a wrapper buffer that unregisters on release.
+  iree_hal_cuda_stream_imported_buffer_info_t* info = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(iree_allocator_system(),
+                                              sizeof(*info), (void**)&info));
+  info->cuda_symbols = command_buffer->cuda_symbols;
+  info->host_ptr = host_ptr;
+
+  iree_hal_buffer_release_callback_t release_callback = {
+      .fn = iree_hal_cuda_stream_imported_buffer_release,
+      .user_data = info,
+  };
+  iree_hal_buffer_t* cuda_wrapper = NULL;
+  const iree_hal_buffer_placement_t placement = {
+      .device = NULL,
+      .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+      .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE,
+  };
+  status = iree_hal_cuda_buffer_wrap(
+      placement,
+      IREE_HAL_MEMORY_TYPE_HOST_VISIBLE | IREE_HAL_MEMORY_TYPE_HOST_COHERENT,
+      IREE_HAL_MEMORY_ACCESS_ALL, iree_hal_buffer_allowed_usage(allocated),
+      alloc_size, 0, alloc_size, IREE_HAL_CUDA_BUFFER_TYPE_HOST_REGISTERED,
+      device_ptr, host_ptr, release_callback,
+      command_buffer->host_allocator, &cuda_wrapper);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_cuda_stream_imported_buffer_release(info, NULL);
+    return status;
+  }
+
+  // Track in resource set so it lives until the command completes.
+  status = iree_hal_resource_set_insert(command_buffer->resource_set, 1,
+                                         &cuda_wrapper);
+  // Release our reference; resource_set now owns it.
+  iree_hal_buffer_release(cuda_wrapper);
+  if (!iree_status_is_ok(status)) return status;
+
+  *out_device_ptr = device_ptr;
+  return iree_ok_status();
+}
 
 static iree_hal_cuda_stream_command_buffer_t*
 iree_hal_cuda_stream_command_buffer_cast(
@@ -336,8 +451,10 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_fill_buffer(
       z0,
       iree_hal_cuda_stream_command_buffer_flush_collectives(command_buffer));
 
-  CUdeviceptr target_device_buffer = iree_hal_cuda_buffer_device_pointer(
-      iree_hal_buffer_allocated_buffer(target_ref.buffer));
+  CUdeviceptr target_device_buffer = 0;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_cuda_stream_resolve_buffer_device_pointer(
+              command_buffer, target_ref.buffer, &target_device_buffer));
   iree_device_size_t target_offset =
       iree_hal_buffer_byte_offset(target_ref.buffer) + target_ref.offset;
   CUdeviceptr dst = target_device_buffer + target_offset;
@@ -406,8 +523,10 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_update_buffer(
   }
 
   // Issue the copy using the scratch memory as the source.
-  CUdeviceptr target_device_buffer = iree_hal_cuda_buffer_device_pointer(
-      iree_hal_buffer_allocated_buffer(target_ref.buffer));
+  CUdeviceptr target_device_buffer = 0;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_cuda_stream_resolve_buffer_device_pointer(
+              command_buffer, target_ref.buffer, &target_device_buffer));
   CUdeviceptr dst = target_device_buffer +
                     iree_hal_buffer_byte_offset(target_ref.buffer) +
                     target_ref.offset;
@@ -432,12 +551,16 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_copy_buffer(
       z0,
       iree_hal_cuda_stream_command_buffer_flush_collectives(command_buffer));
 
-  CUdeviceptr source_device_buffer = iree_hal_cuda_buffer_device_pointer(
-      iree_hal_buffer_allocated_buffer(source_ref.buffer));
+  CUdeviceptr source_device_buffer = 0;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_cuda_stream_resolve_buffer_device_pointer(
+              command_buffer, source_ref.buffer, &source_device_buffer));
   iree_device_size_t source_offset =
       iree_hal_buffer_byte_offset(source_ref.buffer) + source_ref.offset;
-  CUdeviceptr target_device_buffer = iree_hal_cuda_buffer_device_pointer(
-      iree_hal_buffer_allocated_buffer(target_ref.buffer));
+  CUdeviceptr target_device_buffer = 0;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_hal_cuda_stream_resolve_buffer_device_pointer(
+              command_buffer, target_ref.buffer, &target_device_buffer));
   iree_device_size_t target_offset =
       iree_hal_buffer_byte_offset(target_ref.buffer) + target_ref.offset;
   CUdeviceptr src = source_device_buffer + source_offset;
@@ -569,8 +692,10 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
       IREE_RETURN_AND_END_ZONE_IF_ERROR(
           z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
                                            &binding->buffer));
-      CUdeviceptr device_buffer = iree_hal_cuda_buffer_device_pointer(
-          iree_hal_buffer_allocated_buffer(binding->buffer));
+      CUdeviceptr device_buffer = 0;
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_hal_cuda_stream_resolve_buffer_device_pointer(
+                  command_buffer, binding->buffer, &device_buffer));
       iree_device_size_t offset = iree_hal_buffer_byte_offset(binding->buffer);
       device_ptr = device_buffer + offset + binding->offset;
     }

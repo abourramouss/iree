@@ -8,12 +8,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/base/internal/arena.h"
 #include "iree/base/internal/event_pool.h"
 #include "iree/base/internal/math.h"
 #include "iree/hal/drivers/cuda/cuda_allocator.h"
+#include "iree/hal/drivers/cuda/cuda_buffer.h"
 #include "iree/hal/drivers/cuda/cuda_dynamic_symbols.h"
 #include "iree/hal/drivers/cuda/cuda_status_util.h"
 #include "iree/hal/drivers/cuda/event_pool.h"
@@ -186,6 +188,13 @@ iree_hal_cuda_deferred_work_queue_device_interface_semaphore_acquire_timepoint_d
     iree_hal_deferred_work_queue_device_interface_t* base_device_interface,
     struct iree_hal_semaphore_t* semaphore, uint64_t value,
     iree_hal_deferred_work_queue_native_event_t* out_event) {
+  // Foreign semaphores (e.g. from local-task) can't participate in device
+  // signaling — they don't have CUevents. Return NULL and let the host
+  // callback (semaphore_list_signal) handle them.
+  if (!iree_hal_cuda_semaphore_isa(semaphore)) {
+    *out_event = NULL;
+    return iree_ok_status();
+  }
   return iree_hal_cuda_event_semaphore_acquire_timepoint_device_signal(
       semaphore, value, (CUevent*)out_event);
 }
@@ -259,6 +268,74 @@ iree_hal_cuda_deferred_work_queue_device_interface_submit_command_buffer(
     }
   }
   return status;
+}
+
+static iree_status_t
+iree_hal_cuda_deferred_work_queue_device_interface_async_alloc(
+    iree_hal_deferred_work_queue_device_interface_t* base_device_interface,
+    iree_hal_buffer_t* buffer) {
+  iree_hal_cuda_deferred_work_queue_device_interface_t* device_interface =
+      (iree_hal_cuda_deferred_work_queue_device_interface_t*)(
+          base_device_interface);
+  // Access the parent device directly (the device_interface->device was set
+  // during device creation and points to our iree_hal_cuda_device_t).
+  iree_hal_cuda_device_t* device =
+      (iree_hal_cuda_device_t*)device_interface->device;
+
+  iree_device_size_t allocation_size =
+      iree_hal_buffer_allocation_size(buffer);
+
+  // Select memory pool based on buffer memory type.
+  CUmemoryPool memory_pool =
+      iree_all_bits_set(iree_hal_buffer_memory_type(buffer),
+                        IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)
+          ? device->memory_pools.device_local
+          : device->memory_pools.other;
+
+  // Perform the async allocation on the dispatch stream.
+  CUdeviceptr device_ptr = 0;
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device_interface->cuda_symbols,
+      cuMemAllocFromPoolAsync(&device_ptr, (size_t)allocation_size, memory_pool,
+                              device_interface->dispatch_cu_stream),
+      "cuMemAllocFromPoolAsync"));
+
+  // Set the device pointer on the pre-created buffer.
+  iree_hal_cuda_buffer_set_device_pointer(buffer, device_ptr);
+
+  // Update pool statistics.
+  iree_hal_cuda_memory_pool_track_alloc(&device->memory_pools, buffer);
+
+  return iree_ok_status();
+}
+
+static iree_status_t
+iree_hal_cuda_deferred_work_queue_device_interface_async_dealloc(
+    iree_hal_deferred_work_queue_device_interface_t* base_device_interface,
+    iree_hal_buffer_t* buffer) {
+  iree_hal_cuda_deferred_work_queue_device_interface_t* device_interface =
+      (iree_hal_cuda_deferred_work_queue_device_interface_t*)(
+          base_device_interface);
+  // Access the parent device directly.
+  iree_hal_cuda_device_t* device =
+      (iree_hal_cuda_device_t*)device_interface->device;
+
+  // Only process async pool buffers.
+  if (iree_hal_cuda_buffer_type(buffer) == IREE_HAL_CUDA_BUFFER_TYPE_ASYNC) {
+    CUdeviceptr device_ptr = iree_hal_cuda_buffer_device_pointer(buffer);
+    IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+        device_interface->cuda_symbols,
+        cuMemFreeAsync(device_ptr, device_interface->dispatch_cu_stream),
+        "cuMemFreeAsync"));
+
+    // Drop the release callback to prevent double-free.
+    iree_hal_cuda_buffer_drop_release_callback(buffer);
+
+    // Update pool statistics.
+    iree_hal_cuda_memory_pool_track_free(&device->memory_pools, buffer);
+  }
+
+  return iree_ok_status();
 }
 
 typedef struct iree_hal_cuda_tracing_device_interface_t {
@@ -1003,22 +1080,34 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
 
-  // Ensure the correct CUDA context is current for this device.
+  // NOTE: we use the generic semaphore wait here (vtable dispatch) so that
+  // foreign semaphores from other HAL drivers (e.g. local-task) are handled
+  // correctly. Allocations are fast so blocking the VM thread is acceptable.
+  fprintf(stderr, "[CUDA] queue_alloca: wait_count=%zu signal_count=%zu size=%zu\n",
+          wait_semaphore_list.count, signal_semaphore_list.count,
+          (size_t)allocation_size);
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    fprintf(stderr, "[CUDA]   wait[%zu]: is_cuda=%d value=%lu\n", i,
+            iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i]),
+            (unsigned long)wait_semaphore_list.payload_values[i]);
+  }
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
-
-  // NOTE: block on the semaphores here; we could avoid this by properly
-  // sequencing device work with semaphores. The CUDA HAL is not currently
-  // asynchronous.
+  fprintf(stderr, "[CUDA] queue_alloca: waiting...\n");
   IREE_RETURN_IF_ERROR(
       iree_hal_semaphore_list_wait(wait_semaphore_list, iree_infinite_timeout(),
                                    IREE_HAL_WAIT_FLAG_DEFAULT));
+  fprintf(stderr, "[CUDA] queue_alloca: wait done, allocating\n");
 
-  // Allocate from the pool; likely to fail in cases of virtual memory
-  // exhaustion but the error may be deferred until a later synchronization.
-  // If pools are not supported we allocate a buffer as normal from whatever
-  // allocator is set on the device.
+  // Force HOST_VISIBLE so the allocator uses cuMemAllocManaged (unified
+  // memory). This allows output buffers to be read back from the host without
+  // a separate DtoH copy, which is required in multi-device scenarios where
+  // the tooling transfers outputs via the primary (CPU) device.
+  params.type |= IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
+  // Also allow mapping so the buffer can be map_range'd for readback.
+  params.usage |= IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED;
+
   iree_status_t status = iree_ok_status();
   if (device->supports_memory_pools &&
       !iree_all_bits_set(params.type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
@@ -1031,12 +1120,11 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
         out_buffer);
   }
 
-  // Only signal if not returning a synchronous error - synchronous failure
-  // indicates that the stream is unchanged (it's not really since we waited
-  // above, but we at least won't deadlock like this).
   if (iree_status_is_ok(status)) {
     status = iree_hal_semaphore_list_signal(signal_semaphore_list);
   }
+  fprintf(stderr, "[CUDA] queue_alloca: done ok=%d\n",
+          (int)iree_status_is_ok(status));
   return status;
 }
 
@@ -1051,32 +1139,15 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
     iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
 
-  // Ensure the correct CUDA context is current for this device.
+  // NOTE: we use the generic semaphore wait here (vtable dispatch) so that
+  // foreign semaphores from other HAL drivers are handled correctly.
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
-
-  // NOTE: block on the semaphores here; we could avoid this by properly
-  // sequencing device work with semaphores. The CUDA HAL is not currently
-  // asynchronous.
   IREE_RETURN_IF_ERROR(
       iree_hal_semaphore_list_wait(wait_semaphore_list, iree_infinite_timeout(),
                                    IREE_HAL_WAIT_FLAG_DEFAULT));
-
-  // Schedule the buffer deallocation if we got it from a pool and otherwise
-  // drop it on the floor and let it be freed when the buffer is released.
-  iree_status_t status = iree_ok_status();
-  if (device->supports_memory_pools) {
-    status = iree_hal_cuda_memory_pools_dealloca(
-        &device->memory_pools, device->dispatch_cu_stream, buffer, flags);
-  }
-
-  // Only signal if not returning a synchronous error - synchronous failure
-  // indicates that the stream is unchanged (it's not really since we waited
-  // above, but we at least won't deadlock like this).
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_semaphore_list_signal(signal_semaphore_list);
-  }
+  iree_status_t status = iree_hal_semaphore_list_signal(signal_semaphore_list);
   return status;
 }
 
@@ -1127,6 +1198,25 @@ static void iree_hal_cuda_device_collect_tracing_context(void* user_data) {
       (iree_hal_stream_tracing_context_t*)user_data);
 }
 
+// Context passed to the release callback for imported (host-registered) buffers.
+typedef struct iree_hal_cuda_imported_buffer_info_t {
+  const iree_hal_cuda_dynamic_symbols_t* cuda_symbols;
+  void* host_ptr;
+} iree_hal_cuda_imported_buffer_info_t;
+
+// Release callback that unregisters host memory from CUDA when the wrapper
+// buffer is destroyed.
+static void iree_hal_cuda_imported_buffer_release(
+    void* user_data, iree_hal_buffer_t* buffer) {
+  iree_hal_cuda_imported_buffer_info_t* info =
+      (iree_hal_cuda_imported_buffer_info_t*)user_data;
+  if (info->host_ptr) {
+    IREE_CUDA_IGNORE_ERROR(info->cuda_symbols,
+                           cuMemHostUnregister(info->host_ptr));
+  }
+  iree_allocator_free(iree_allocator_system(), info);
+}
+
 static iree_status_t iree_hal_cuda_device_queue_execute(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     const iree_hal_semaphore_list_t wait_semaphore_list,
@@ -1137,14 +1227,216 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // Pre-wait any foreign (non-CUDA) semaphores before enqueueing.
+  // The deferred work queue can only handle native CUDA semaphores via device
+  // events; foreign semaphores (e.g. from local-task) would stay pending
+  // forever. By pre-waiting them here using the generic vtable dispatch,
+  // they'll be signaled by the time the deferred work queue processes the
+  // action and iree_hal_semaphore_query() will show them as satisfied.
+  fprintf(stderr,
+          "[CUDA] queue_execute: wait_count=%zu signal_count=%zu cmd=%p "
+          "bindings=%zu\n",
+          wait_semaphore_list.count, signal_semaphore_list.count,
+          (void*)command_buffer, binding_table.count);
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    bool is_cuda =
+        iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i]);
+    fprintf(stderr, "[CUDA]   wait[%zu]: is_cuda=%d value=%lu\n", i, is_cuda,
+            (unsigned long)wait_semaphore_list.payload_values[i]);
+    if (!is_cuda) {
+      iree_status_t status = iree_hal_semaphore_wait(
+          wait_semaphore_list.semaphores[i],
+          wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
+          IREE_HAL_WAIT_FLAG_DEFAULT);
+      if (!iree_status_is_ok(status)) {
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+    }
+  }
+
+  // Ensure the correct CUDA context for host memory registration.
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, IREE_CURESULT_TO_STATUS(device->cuda_symbols,
+                                   cuCtxSetCurrent(device->cu_context),
+                                   "cuCtxSetCurrent"));
+
+  // Import foreign (non-CUDA) buffers in the binding table by registering
+  // their host memory with CUDA via cuMemHostRegister. This gives us a valid
+  // CUdeviceptr that GPU kernels can use to access the data.
+  // We create a mutable copy of the binding table and replace foreign buffer
+  // entries with CUDA wrapper buffers.
+  iree_hal_buffer_binding_t* local_bindings = NULL;
+  iree_hal_buffer_binding_table_t local_binding_table = binding_table;
+  if (binding_table.count > 0) {
+    iree_host_size_t bindings_size =
+        binding_table.count * sizeof(iree_hal_buffer_binding_t);
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_allocator_malloc(device->host_allocator, bindings_size,
+                                  (void**)&local_bindings));
+    memcpy(local_bindings, binding_table.bindings, bindings_size);
+    local_binding_table.bindings = local_bindings;
+
+    for (iree_host_size_t i = 0; i < binding_table.count; ++i) {
+      iree_hal_buffer_t* buffer = local_bindings[i].buffer;
+      if (!buffer) continue;
+
+      // Get the underlying allocated buffer (unwrap subspans).
+      iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+      if (iree_hal_cuda_buffer_isa(allocated)) continue;
+
+      // Foreign buffer: map to get host pointer, register with CUDA.
+      fprintf(stderr, "[CUDA]   importing foreign buffer[%zu] size=%zu\n", i,
+              (size_t)iree_hal_buffer_allocation_size(allocated));
+
+      iree_hal_buffer_mapping_t mapping;
+      iree_status_t status = iree_hal_buffer_map_range(
+          allocated, IREE_HAL_MAPPING_MODE_PERSISTENT,
+          IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, 0,
+          iree_hal_buffer_allocation_size(allocated), &mapping);
+      if (!iree_status_is_ok(status)) {
+        // Try read-only if read-write fails.
+        status = iree_hal_buffer_map_range(
+            allocated, IREE_HAL_MAPPING_MODE_PERSISTENT,
+            IREE_HAL_MEMORY_ACCESS_READ, 0,
+            iree_hal_buffer_allocation_size(allocated), &mapping);
+      }
+      if (!iree_status_is_ok(status)) {
+        fprintf(stderr,
+                "[CUDA]   FAILED to map foreign buffer[%zu] code=%d\n", i,
+                (int)iree_status_code(status));
+        // Release any previously imported buffers.
+        for (iree_host_size_t j = 0; j < i; ++j) {
+          if (local_bindings[j].buffer != binding_table.bindings[j].buffer) {
+            iree_hal_buffer_release(local_bindings[j].buffer);
+          }
+        }
+        iree_allocator_free(device->host_allocator, local_bindings);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+
+      void* host_ptr = mapping.contents.data;
+      iree_device_size_t alloc_size =
+          iree_hal_buffer_allocation_size(allocated);
+
+      // Unmap - we have the pointer and it stays valid (heap buffer).
+      iree_hal_buffer_unmap_range(&mapping);
+
+      // Register host memory with CUDA.
+      CUdeviceptr device_ptr = 0;
+      status = IREE_CURESULT_TO_STATUS(
+          device->cuda_symbols,
+          cuMemHostRegister(host_ptr, (size_t)alloc_size,
+                            CU_MEMHOSTREGISTER_DEVICEMAP),
+          "cuMemHostRegister");
+      if (iree_status_is_ok(status)) {
+        status = IREE_CURESULT_TO_STATUS(
+            device->cuda_symbols,
+            cuMemHostGetDevicePointer(&device_ptr, host_ptr, 0),
+            "cuMemHostGetDevicePointer");
+      }
+      if (!iree_status_is_ok(status)) {
+        fprintf(stderr,
+                "[CUDA]   FAILED to register foreign buffer[%zu] code=%d\n", i,
+                (int)iree_status_code(status));
+        for (iree_host_size_t j = 0; j < i; ++j) {
+          if (local_bindings[j].buffer != binding_table.bindings[j].buffer) {
+            iree_hal_buffer_release(local_bindings[j].buffer);
+          }
+        }
+        iree_allocator_free(device->host_allocator, local_bindings);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+
+      fprintf(stderr,
+              "[CUDA]   registered foreign buffer[%zu] host=%p device=0x%llx\n",
+              i, host_ptr, (unsigned long long)device_ptr);
+
+      // Allocate release callback info.
+      iree_hal_cuda_imported_buffer_info_t* info = NULL;
+      status = iree_allocator_malloc(iree_allocator_system(), sizeof(*info),
+                                     (void**)&info);
+      if (!iree_status_is_ok(status)) {
+        IREE_CUDA_IGNORE_ERROR(device->cuda_symbols,
+                               cuMemHostUnregister(host_ptr));
+        for (iree_host_size_t j = 0; j < i; ++j) {
+          if (local_bindings[j].buffer != binding_table.bindings[j].buffer) {
+            iree_hal_buffer_release(local_bindings[j].buffer);
+          }
+        }
+        iree_allocator_free(device->host_allocator, local_bindings);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+      info->cuda_symbols = device->cuda_symbols;
+      info->host_ptr = host_ptr;
+
+      iree_hal_buffer_release_callback_t release_callback = {
+          .fn = iree_hal_cuda_imported_buffer_release,
+          .user_data = info,
+      };
+
+      // Create CUDA buffer wrapper.
+      iree_hal_buffer_t* cuda_buffer = NULL;
+      const iree_hal_buffer_placement_t placement = {
+          .device = base_device,
+          .queue_affinity = IREE_HAL_QUEUE_AFFINITY_ANY,
+          .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE,
+      };
+      status = iree_hal_cuda_buffer_wrap(
+          placement,
+          IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
+              IREE_HAL_MEMORY_TYPE_HOST_COHERENT,
+          IREE_HAL_MEMORY_ACCESS_ALL, iree_hal_buffer_allowed_usage(allocated),
+          alloc_size, /*byte_offset=*/0,
+          /*byte_length=*/alloc_size,
+          IREE_HAL_CUDA_BUFFER_TYPE_HOST_REGISTERED, device_ptr, host_ptr,
+          release_callback, device->host_allocator, &cuda_buffer);
+      if (!iree_status_is_ok(status)) {
+        iree_hal_cuda_imported_buffer_release(info, NULL);
+        for (iree_host_size_t j = 0; j < i; ++j) {
+          if (local_bindings[j].buffer != binding_table.bindings[j].buffer) {
+            iree_hal_buffer_release(local_bindings[j].buffer);
+          }
+        }
+        iree_allocator_free(device->host_allocator, local_bindings);
+        IREE_TRACE_ZONE_END(z0);
+        return status;
+      }
+
+      // Replace the binding table entry with the CUDA wrapper.
+      // Preserve original offset/length relative to the allocated buffer.
+      local_bindings[i].buffer = cuda_buffer;
+      // The original binding offset is relative to the original buffer which
+      // may be a subspan. We need to add the subspan's byte_offset.
+      local_bindings[i].offset =
+          binding_table.bindings[i].offset +
+          iree_hal_buffer_byte_offset(buffer);
+      local_bindings[i].length = binding_table.bindings[i].length;
+    }
+  }
+
   iree_status_t status = iree_hal_deferred_work_queue_enqueue(
       device->work_queue, iree_hal_cuda_device_collect_tracing_context,
       device->tracing_context, wait_semaphore_list, signal_semaphore_list,
       command_buffer ? 1 : 0, command_buffer ? &command_buffer : NULL,
-      &binding_table);
+      &local_binding_table);
   if (iree_status_is_ok(status)) {
     // Try to advance the deferred work queue.
     status = iree_hal_deferred_work_queue_issue(device->work_queue);
+  }
+
+  // Release our references to imported buffers. The DWQ's resource_set now
+  // holds references to them and will release when the action completes.
+  if (local_bindings) {
+    for (iree_host_size_t i = 0; i < binding_table.count; ++i) {
+      if (local_bindings[i].buffer != binding_table.bindings[i].buffer) {
+        iree_hal_buffer_release(local_bindings[i].buffer);
+      }
+    }
+    iree_allocator_free(device->host_allocator, local_bindings);
   }
 
   IREE_TRACE_ZONE_END(z0);
@@ -1257,8 +1549,10 @@ static const iree_hal_deferred_work_queue_device_interface_vtable_t
             iree_hal_cuda_deferred_work_queue_device_interface_create_stream_command_buffer,
         .submit_command_buffer =
             iree_hal_cuda_deferred_work_queue_device_interface_submit_command_buffer,
-        .async_alloc = NULL,
-        .async_dealloc = NULL,
+        .async_alloc =
+            iree_hal_cuda_deferred_work_queue_device_interface_async_alloc,
+        .async_dealloc =
+            iree_hal_cuda_deferred_work_queue_device_interface_async_dealloc,
 };
 
 static const iree_hal_stream_tracing_device_interface_vtable_t

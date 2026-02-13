@@ -51,6 +51,10 @@ bool iree_hal_cuda_semaphore_acquire_event_host_wait(
     iree_hal_semaphore_t* base_semaphore, uint64_t min_value,
     iree_hal_cuda_event_t** out_event);
 
+// Returns true if |semaphore| is a CUDA event semaphore (as opposed to a
+// foreign semaphore from another HAL driver like local-task).
+bool iree_hal_cuda_semaphore_isa(iree_hal_semaphore_t* semaphore);
+
 // Performs a multi-wait on one or more semaphores. Returns
 // IREE_STATUS_DEADLINE_EXCEEDED if the wait does not complete before |timeout|.
 iree_status_t iree_hal_cuda_semaphore_multi_wait(

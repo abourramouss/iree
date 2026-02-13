@@ -6,6 +6,8 @@
 
 #include "iree/hal/drivers/cuda/event_semaphore.h"
 
+#include <stdio.h>
+
 #include "iree/base/internal/wait_handle.h"
 #include "iree/base/threading/mutex.h"
 #include "iree/hal/drivers/cuda/cuda_dynamic_symbols.h"
@@ -166,6 +168,8 @@ static void iree_hal_cuda_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
   IREE_TRACE_ZONE_BEGIN(z0);
 
   const iree_status_code_t status_code = iree_status_code(status);
+  fprintf(stderr, "[CUDA] SEMAPHORE FAIL: sem=%p status_code=%d\n",
+          (void*)base_semaphore, (int)status_code);
 
   iree_slim_mutex_lock(&semaphore->mutex);
 
@@ -592,6 +596,10 @@ static iree_status_t iree_hal_cuda_semaphore_export_timepoint(
     iree_hal_external_timepoint_t* IREE_RESTRICT out_external_timepoint) {
   return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
                           "timepoint export is not yet implemented");
+}
+
+bool iree_hal_cuda_semaphore_isa(iree_hal_semaphore_t* semaphore) {
+  return iree_hal_resource_is(semaphore, &iree_hal_cuda_semaphore_vtable);
 }
 
 static const iree_hal_semaphore_vtable_t iree_hal_cuda_semaphore_vtable = {

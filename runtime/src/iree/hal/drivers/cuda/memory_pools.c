@@ -132,7 +132,7 @@ void iree_hal_cuda_memory_pools_deinitialize(
   IREE_TRACE_ZONE_END(z0);
 }
 
-static void iree_hal_cuda_memory_pool_track_alloc(
+void iree_hal_cuda_memory_pool_track_alloc(
     iree_hal_cuda_memory_pools_t* pools, iree_hal_buffer_t* buffer) {
   bool is_device_local = iree_all_bits_set(iree_hal_buffer_memory_type(buffer),
                                            IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL);
@@ -152,7 +152,7 @@ static void iree_hal_cuda_memory_pool_track_alloc(
   });
 }
 
-static void iree_hal_cuda_memory_pool_track_free(
+void iree_hal_cuda_memory_pool_track_free(
     iree_hal_cuda_memory_pools_t* pools, iree_hal_buffer_t* buffer) {
   bool is_device_local = iree_all_bits_set(iree_hal_buffer_memory_type(buffer),
                                            IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL);
@@ -221,7 +221,7 @@ iree_status_t iree_hal_cuda_memory_pools_trim(
 // NOTE: this is only issued if the buffer is destroyed without having had been
 // scheduled for deallocation asynchronously. When a buffer is scheduled we drop
 // the release callback so that this isn't called and we don't double-free.
-static void iree_hal_cuda_async_buffer_release_callback(
+void iree_hal_cuda_memory_pools_async_buffer_release_callback(
     void* user_data, iree_hal_buffer_t* buffer) {
   iree_hal_cuda_memory_pools_t* pools =
       (iree_hal_cuda_memory_pools_t*)user_data;
@@ -274,7 +274,7 @@ iree_status_t iree_hal_cuda_memory_pools_alloca(
         .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_ASYNCHRONOUS,
     };
     iree_hal_buffer_release_callback_t release_callback = {
-        .fn = iree_hal_cuda_async_buffer_release_callback,
+        .fn = iree_hal_cuda_memory_pools_async_buffer_release_callback,
         .user_data = pools,
     };
     status = iree_hal_cuda_buffer_wrap(
