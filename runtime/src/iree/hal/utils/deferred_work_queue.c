@@ -1039,8 +1039,6 @@ static void iree_hal_deferred_work_queue_fail_status_locked(
 static void iree_hal_deferred_work_queue_action_fail_locked(
     iree_hal_deferred_work_queue_action_t* action, iree_status_t status) {
   IREE_ASSERT(!iree_status_is_ok(status));
-  fprintf(stderr, "[DWQ] ACTION FAIL: kind=%d status_code=%d\n",
-          (int)action->kind, (int)iree_status_code(status));
   iree_hal_deferred_work_queue_t* actions = action->owning_actions;
 
   // Unlock since failing the semaphore will use |actions|.
@@ -1114,18 +1112,6 @@ static void iree_hal_deferred_work_queue_fail_locked(
 // Does not consume |status|.
 static void iree_hal_deferred_work_queue_fail(
     iree_hal_deferred_work_queue_t* actions, iree_status_t status) {
-  iree_allocator_t allocator = iree_allocator_system();
-  char* status_str = NULL;
-  iree_host_size_t status_str_len = 0;
-  if (iree_status_to_string(status, &allocator, &status_str,
-                             &status_str_len)) {
-    fprintf(stderr, "[DWQ] GLOBAL FAIL: %.*s\n", (int)status_str_len,
-            status_str);
-    iree_allocator_free(allocator, status_str);
-  } else {
-    fprintf(stderr, "[DWQ] GLOBAL FAIL: status_code=%d\n",
-            (int)iree_status_code(status));
-  }
   iree_slim_mutex_lock(&actions->action_mutex);
   iree_hal_deferred_work_queue_fail_locked(actions, status);
   iree_slim_mutex_unlock(&actions->action_mutex);
@@ -1142,12 +1128,7 @@ iree_hal_deferred_work_queue_execution_device_signal_host_callback(
   IREE_ASSERT_LE(action->kind, IREE_HAL_QUEUE_ACTION_TYPE_QUEUE_MAX);
   IREE_ASSERT_EQ(action->state, IREE_HAL_QUEUE_ACTION_STATE_ALIVE);
 
-  fprintf(stderr, "[DWQ] HOST_CB: kind=%d signal_count=%d status_code=%d\n",
-          (int)action->kind, (int)action->signal_semaphore_list.count,
-          (int)iree_status_code(status));
-
   if (IREE_UNLIKELY(!iree_status_is_ok(status))) {
-    fprintf(stderr, "[DWQ] HOST_CB: action failed, propagating\n");
     iree_hal_deferred_work_queue_action_fail(action, status);
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
@@ -1157,21 +1138,13 @@ iree_hal_deferred_work_queue_execution_device_signal_host_callback(
   // time someone else may issue the pending queue actions.
   // If we push first to the deferred work list, the cleanup of this action
   // may run while we are still using the semaphore list, causing a crash.
-  for (iree_host_size_t i = 0; i < action->signal_semaphore_list.count; ++i) {
-    fprintf(stderr, "[DWQ] HOST_CB: signaling sem[%zu]=%p value=%lu\n",
-            i, (void*)action->signal_semaphore_list.semaphores[i],
-            (unsigned long)action->signal_semaphore_list.payload_values[i]);
-  }
   status = iree_hal_semaphore_list_signal(action->signal_semaphore_list);
   if (IREE_UNLIKELY(!iree_status_is_ok(status))) {
-    fprintf(stderr, "[DWQ] HOST_CB: signal FAILED status_code=%d\n",
-            (int)iree_status_code(status));
     iree_hal_deferred_work_queue_action_fail(action, status);
     IREE_TRACE_ZONE_END(z0);
     return status;
   }
 
-  fprintf(stderr, "[DWQ] HOST_CB: signal done, destroying action\n");
   iree_hal_deferred_work_queue_action_destroy(action);
 
   IREE_TRACE_ZONE_END(z0);
@@ -1188,12 +1161,7 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
       actions->device_interface;
   IREE_TRACE_ZONE_BEGIN(z0);
 
-  fprintf(stderr,
-          "[DWQ] ISSUE_EXEC: kind=%d event_count=%d wait_count=%d "
-          "signal_count=%d\n",
-          (int)action->kind, (int)action->event_count,
-          (int)action->wait_semaphore_list.count,
-          (int)action->signal_semaphore_list.count);
+
 
   // No need to lock given that this action is already detched from the pending
   // actions list; so only this thread is seeing it now.
@@ -1204,23 +1172,16 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
         device_interface->vtable->device_wait_on_host_event(
             device_interface, action->wait_events[i]);
     if (!iree_status_is_ok(wait_status)) {
-      fprintf(stderr, "[DWQ] ISSUE_EXEC: FAIL at wait_event[%d] code=%d\n",
-              (int)i, (int)iree_status_code(wait_status));
       IREE_TRACE_ZONE_END(z0);
       return wait_status;
     }
   }
-  fprintf(stderr, "[DWQ] ISSUE_EXEC: wait_events done\n");
-
   switch (action->kind) {
     case IREE_HAL_QUEUE_ACTION_TYPE_EXECUTION: {
       // Then launch all command buffers to the dispatch stream.
       IREE_TRACE_ZONE_BEGIN(z_dispatch_command_buffers);
       IREE_TRACE_ZONE_APPEND_TEXT(z_dispatch_command_buffers,
                                   "dispatch_command_buffers");
-
-      fprintf(stderr, "[DWQ] ISSUE_EXEC: cmd_buf_count=%d\n",
-              (int)action->payload.execution.count);
 
       for (iree_host_size_t i = 0; i < action->payload.execution.count; ++i) {
         iree_hal_command_buffer_t* command_buffer =
@@ -1244,9 +1205,6 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
                   device_interface, mode, IREE_HAL_COMMAND_CATEGORY_ANY,
                   &stream_command_buffer);
           if (!iree_status_is_ok(s1)) {
-            fprintf(stderr,
-                    "[DWQ] ISSUE_EXEC: FAIL at create_stream_cmd_buf code=%d\n",
-                    (int)iree_status_code(s1));
             IREE_TRACE_ZONE_END(z_dispatch_command_buffers);
             IREE_TRACE_ZONE_END(z0);
             return s1;
@@ -1258,9 +1216,6 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
           iree_status_t s2 = iree_hal_deferred_command_buffer_apply(
               command_buffer, stream_command_buffer, binding_table);
           if (!iree_status_is_ok(s2)) {
-            fprintf(stderr,
-                    "[DWQ] ISSUE_EXEC: FAIL at cmd_buf_apply[%d] code=%d\n",
-                    (int)i, (int)iree_status_code(s2));
             IREE_TRACE_ZONE_END(z_dispatch_command_buffers);
             IREE_TRACE_ZONE_END(z0);
             return s2;
@@ -1273,17 +1228,11 @@ static iree_status_t iree_hal_deferred_work_queue_issue_execution(
         iree_status_t s3 = device_interface->vtable->submit_command_buffer(
             device_interface, command_buffer);
         if (!iree_status_is_ok(s3)) {
-          fprintf(stderr,
-                  "[DWQ] ISSUE_EXEC: FAIL at submit_cmd_buf[%d] code=%d\n",
-                  (int)i, (int)iree_status_code(s3));
           iree_hal_resource_release(command_buffer);
           IREE_TRACE_ZONE_END(z_dispatch_command_buffers);
           IREE_TRACE_ZONE_END(z0);
           return s3;
         }
-
-        fprintf(stderr, "[DWQ] ISSUE_EXEC: cmd_buf[%d] submitted ok\n",
-                (int)i);
 
         // The stream_command_buffer is going to be retained by
         // the action->resource_set and deleted after the action
@@ -1440,12 +1389,6 @@ iree_status_t iree_hal_deferred_work_queue_issue(
         iree_status_t semaphore_status =
             iree_hal_semaphore_query(semaphores[i], &value);
         if (IREE_UNLIKELY(!iree_status_is_ok(semaphore_status))) {
-          fprintf(stderr,
-                  "[DWQ] ISSUE_SCAN: sem_query FAILED sem=%p value=%lu "
-                  "target=%lu code=%d\n",
-                  (void*)semaphores[i], (unsigned long)value,
-                  (unsigned long)values[i],
-                  (int)iree_status_code(semaphore_status));
           iree_hal_deferred_work_queue_action_fail_locked(action,
                                                           semaphore_status);
           iree_status_ignore(semaphore_status);
@@ -1689,9 +1632,6 @@ static void iree_hal_deferred_work_queue_worker_process_completion(
         iree_hal_deferred_work_queue_completion_list_pop(worklist);
     if (!entry) break;
 
-    fprintf(stderr, "[DWQ] COMPLETION: waiting on native event %p\n",
-            entry->native_event);
-
     if (IREE_LIKELY(iree_status_is_ok(status))) {
       IREE_TRACE_ZONE_BEGIN_NAMED(z1, "synchronize_native_event");
       status = actions->device_interface->vtable->synchronize_native_event(
@@ -1699,16 +1639,10 @@ static void iree_hal_deferred_work_queue_worker_process_completion(
       IREE_TRACE_ZONE_END(z1);
     }
 
-    fprintf(stderr, "[DWQ] COMPLETION: event %p done, status_code=%d\n",
-            entry->native_event, (int)iree_status_code(status));
-
     if (entry->callback) {
       status =
           iree_status_join(status, entry->callback(status, entry->user_data));
     }
-    fprintf(stderr, "[DWQ] COMPLETION: callback done, status_code=%d\n",
-            (int)iree_status_code(status));
-
     if (IREE_UNLIKELY(entry->created_event)) {
       status = iree_status_join(
           status, actions->device_interface->vtable->destroy_native_event(

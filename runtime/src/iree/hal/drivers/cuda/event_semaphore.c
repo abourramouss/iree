@@ -168,8 +168,6 @@ static void iree_hal_cuda_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
   IREE_TRACE_ZONE_BEGIN(z0);
 
   const iree_status_code_t status_code = iree_status_code(status);
-  fprintf(stderr, "[CUDA] SEMAPHORE FAIL: sem=%p status_code=%d\n",
-          (void*)base_semaphore, (int)status_code);
 
   iree_slim_mutex_lock(&semaphore->mutex);
 

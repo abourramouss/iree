@@ -272,8 +272,17 @@ IREE_API_EXPORT void iree_hal_buffer_release(iree_hal_buffer_t* buffer) {
 IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_memory_type(
     iree_hal_memory_type_t actual_memory_type,
     iree_hal_memory_type_t expected_memory_type) {
+  // PATCH: On Jetson unified memory, HOST_VISIBLE and DEVICE_VISIBLE are
+  // interchangeable since both CPU and GPU share the same physical memory.
+  // Treat HOST_VISIBLE as satisfying DEVICE_VISIBLE and vice versa.
+  iree_hal_memory_type_t adjusted_actual = actual_memory_type;
+  if (iree_any_bit_set(actual_memory_type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
+                                               IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE)) {
+    adjusted_actual |= IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
+                       IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;
+  }
   if (IREE_UNLIKELY(
-          !iree_all_bits_set(actual_memory_type, expected_memory_type))) {
+          !iree_all_bits_set(adjusted_actual, expected_memory_type))) {
 #if IREE_STATUS_MODE
     // Missing one or more bits.
     iree_bitfield_string_temp_t temp0, temp1;

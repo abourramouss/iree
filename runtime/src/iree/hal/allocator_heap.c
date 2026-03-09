@@ -148,7 +148,10 @@ iree_hal_heap_allocator_query_buffer_compatibility(
   // have discrete memory spaces (remoting/sandboxed, GPUs, etc) and makes it
   // much easier to find issues of buffer definition with local devices that
   // will cause issues when used with real devices.
-  if (iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE)) {
+  // PATCH: Also accept DEVICE_LOCAL for QUEUE_DISPATCH to support Jetson
+  // unified memory where CPU can access GPU-allocated buffers.
+  if (iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE) ||
+      iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL)) {
     if (iree_any_bit_set(params->usage, IREE_HAL_BUFFER_USAGE_TRANSFER)) {
       compatibility |= IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER;
     }

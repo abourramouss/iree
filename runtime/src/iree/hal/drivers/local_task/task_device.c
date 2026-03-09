@@ -501,6 +501,7 @@ static iree_status_t iree_hal_task_device_queue_execute(
     iree_hal_buffer_binding_table_t binding_table,
     iree_hal_execute_flags_t flags) {
   iree_hal_task_device_t* device = iree_hal_task_device_cast(base_device);
+
   // NOTE: today we are not discriminating queues based on command type.
   const iree_host_size_t queue_index = iree_hal_task_device_select_queue(
       device, IREE_HAL_COMMAND_CATEGORY_ANY, queue_affinity);
@@ -516,8 +517,8 @@ static iree_status_t iree_hal_task_device_queue_execute(
       .command_buffer = command_buffer,
       .binding_table = binding_table,
   };
-  return iree_hal_task_queue_submit_commands(&device->queues[queue_index], 1,
-                                             &batch);
+  return iree_hal_task_queue_submit_commands(
+      &device->queues[queue_index], 1, &batch);
 }
 
 static iree_status_t iree_hal_task_device_queue_flush(

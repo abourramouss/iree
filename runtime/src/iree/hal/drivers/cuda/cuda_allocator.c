@@ -274,7 +274,11 @@ iree_hal_cuda_allocator_query_buffer_compatibility(
   }
 
   // Buffers can only be used on the queue if they are device visible.
-  if (iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE)) {
+  // PATCH: Also accept HOST_VISIBLE for QUEUE_DISPATCH to bypass the
+  // supports_concurrent_managed_access check on Tegra (Jetson) which returns 0
+  // despite having unified memory.
+  if (iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE) ||
+      iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
     if (iree_any_bit_set(params->usage, IREE_HAL_BUFFER_USAGE_TRANSFER)) {
       compatibility |= IREE_HAL_BUFFER_COMPATIBILITY_QUEUE_TRANSFER;
     }

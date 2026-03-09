@@ -80,9 +80,6 @@ static iree_status_t iree_hal_cuda_stream_resolve_buffer_device_pointer(
 
   // Foreign buffer: map, register, wrap.
   iree_device_size_t alloc_size = iree_hal_buffer_allocation_size(allocated);
-  fprintf(stderr,
-          "[CUDA-CMD] importing foreign buffer %p alloc_size=%zu\n",
-          (void*)allocated, (size_t)alloc_size);
 
   iree_hal_buffer_mapping_t mapping;
   iree_status_t status = iree_hal_buffer_map_range(
@@ -113,9 +110,6 @@ static iree_status_t iree_hal_cuda_stream_resolve_buffer_device_pointer(
         "cuMemHostGetDevicePointer");
   }
   if (!iree_status_is_ok(status)) return status;
-
-  fprintf(stderr, "[CUDA-CMD] registered host=%p device=0x%llx\n",
-          host_ptr, (unsigned long long)device_ptr);
 
   // Create a wrapper buffer that unregisters on release.
   iree_hal_cuda_stream_imported_buffer_info_t* info = NULL;
