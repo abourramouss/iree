@@ -1094,13 +1094,10 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
           IREE_HAL_WAIT_FLAG_DEFAULT));
     }
   }
-  // Force HOST_VISIBLE so the allocator uses cuMemAllocManaged (unified
-  // memory). This allows output buffers to be read back from the host without
-  // a separate DtoH copy, which is required in multi-device scenarios where
-  // the tooling transfers outputs via the primary (CPU) device.
-  params.type |= IREE_HAL_MEMORY_TYPE_HOST_VISIBLE;
-  // Also allow mapping so the buffer can be map_range'd for readback.
-  params.usage |= IREE_HAL_BUFFER_USAGE_MAPPING_SCOPED;
+  // NOTE: Removed forced HOST_VISIBLE that was causing memory leaks.
+  // The original patch forced cuMemAllocManaged for all transient allocations,
+  // but these never got freed by the pool allocator, causing OOM after ~3 calls.
+  // For Jetson unified memory, device-local allocations are still host-accessible.
 
   iree_status_t status = iree_ok_status();
   if (device->supports_memory_pools &&
