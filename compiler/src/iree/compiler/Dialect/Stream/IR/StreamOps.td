@@ -437,15 +437,16 @@ def Stream_ResourceTryMapOp : Stream_PureOp<"resource.try_map", [
 def Stream_ResourceLoadOp : Stream_Op<"resource.load", [
   Util_SizeAwareOp,
 ]> {
-  let summary = [{Loads a value from a staging resource.}];
+  let summary = [{Loads a value from a host-accessible resource.}];
   let description = [{
-    Returns the element(s) at the given offset in the staging resource.
+    Returns the element(s) at the given offset in the resource.
     The operation will complete synchronously against the resource though it may
-    introduce a yield point if the staging resource needs to be transferred.
+    introduce a yield point if the resource needs to be transferred.
+    On unified memory systems, non-staging resources can be read directly.
   }];
 
   let arguments = (ins
-    Stream_StagingResource:$source,
+    Stream_HostAccessibleResource:$source,
     Stream_Size:$source_size,
     Stream_Offset:$source_offset
   );
@@ -475,14 +476,15 @@ def Stream_ResourceStoreOp : Stream_Op<"resource.store", [
   Util_SizeAwareOp,
   MemoryEffects<[MemWrite]>,
 ]> {
-  let summary = [{Stores a value into a staging resource.}];
+  let summary = [{Stores a value into a host-accessible resource.}];
   let description = [{
     The operation will complete synchronously against the resource though it may
-    introduce a yield point if the staging resource needs to be acquired.
+    introduce a yield point if the resource needs to be acquired.
+    On unified memory systems, non-staging resources can be written directly.
   }];
 
   let arguments = (ins
-    Stream_StagingResource:$target,
+    Stream_HostAccessibleResource:$target,
     Stream_Size:$target_size,
     Stream_Offset:$target_offset,
     AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$value
@@ -2571,10 +2573,12 @@ def Stream_AsyncLoadOp : Stream_PureOp<"async.load", [
   let summary = [{Loads a value from a resource.}];
   let description = [{
     Returns the element at the given location from within the resource.
+    Typically operates on staging resources, but on unified memory systems
+    any host-accessible resource lifetime is acceptable.
   }];
 
   let arguments = (ins
-    Stream_StagingResource:$source,
+    Stream_HostAccessibleResource:$source,
     Stream_Size:$source_size,
     Stream_Offset:$source_offset
   );
@@ -2613,17 +2617,18 @@ def Stream_AsyncStoreOp : Stream_PureOp<"async.store", [
   let summary = [{Stores a value into a resource.}];
   let description = [{
     Returns a resource with the element at the given offset set to the given
-    value.
+    value. Typically operates on staging resources, but on unified memory
+    systems any host-accessible resource lifetime is acceptable.
   }];
 
   let arguments = (ins
-    Stream_StagingResource:$target,
+    Stream_HostAccessibleResource:$target,
     Stream_Size:$target_size,
     Stream_Offset:$target_offset,
     AnyTypeOf<[Stream_PrimitiveType, AnyVectorOfNonZeroRank]>:$value
   );
   let results = (outs
-    Stream_StagingResource:$result
+    Stream_HostAccessibleResource:$result
   );
 
   let assemblyFormat = [{

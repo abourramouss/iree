@@ -239,3 +239,79 @@ util.func public @elide_transfer_through_scf_if(%cond: i1, %buffer: !util.buffer
 }
 
 } // module
+
+// -----
+
+// Tests that staging transfers are elided on unified memory when the only
+// users are async.load ops. On systems with unified memory (e.g., Jetson AGX
+// Orin), device memory is host-accessible so the staging transfer and
+// separate allocation are unnecessary.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@device_gpu -> @device_gpu = {unified_memory = true})
+  ]>
+} {
+
+// CHECK-LABEL: @elide_staging_transfer_for_load
+// CHECK-SAME: (%[[RESOURCE:.+]]: !stream.resource<*>)
+util.func public @elide_staging_transfer_for_load(%resource: !stream.resource<*>) -> i32 {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  // The staging transfer should be elided on unified memory.
+  // CHECK-NOT: stream.async.transfer
+  %staged = stream.async.transfer %resource : !stream.resource<*>{%c4}
+      from(#hal.device.promise<@device_gpu>) -> to(#hal.device.promise<@device_gpu>) !stream.resource<staging>{%c4}
+  // The load should read directly from the original resource.
+  // CHECK: %[[VALUE:.+]] = stream.async.load %[[RESOURCE]][%c0]
+  // CHECK-SAME: !stream.resource<*>{%c4} -> i32
+  %value = stream.async.load %staged[%c0] : !stream.resource<staging>{%c4} -> i32
+  // CHECK: util.return %[[VALUE]]
+  util.return %value : i32
+}
+
+} // module
+
+// -----
+
+// Tests that staging transfers are NOT elided without unified memory topology.
+// Without topology info, we must preserve staging transfers.
+
+// CHECK-LABEL: @preserve_staging_transfer_without_topology
+// CHECK-SAME: (%[[RESOURCE:.+]]: !stream.resource<*>)
+util.func public @preserve_staging_transfer_without_topology(%resource: !stream.resource<*>) -> i32 {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  // CHECK: %[[STAGED:.+]] = stream.async.transfer %[[RESOURCE]]
+  %staged = stream.async.transfer %resource : !stream.resource<*>{%c4}
+      from(#hal.device.promise<@device_gpu>) -> to(#hal.device.promise<@device_gpu>) !stream.resource<staging>{%c4}
+  // CHECK: stream.async.load %[[STAGED]]
+  %value = stream.async.load %staged[%c0] : !stream.resource<staging>{%c4} -> i32
+  util.return %value : i32
+}
+
+// -----
+
+// Tests that staging transfers are NOT elided on unified memory when there
+// are non-load/store users that may require staging semantics.
+
+module @test attributes {
+  stream.topology = #hal.device.topology<links = [
+    (@device_gpu -> @device_gpu = {unified_memory = true})
+  ]>
+} {
+
+// CHECK-LABEL: @preserve_staging_transfer_non_load_user
+// CHECK-SAME: (%[[RESOURCE:.+]]: !stream.resource<*>)
+util.func public @preserve_staging_transfer_non_load_user(%resource: !stream.resource<*>) -> !stream.resource<staging> {
+  %c4 = arith.constant 4 : index
+  // The staging transfer should be preserved because the result is returned
+  // as a staging resource (not consumed by a load/store).
+  // CHECK: %[[STAGED:.+]] = stream.async.transfer %[[RESOURCE]]
+  %staged = stream.async.transfer %resource : !stream.resource<*>{%c4}
+      from(#hal.device.promise<@device_gpu>) -> to(#hal.device.promise<@device_gpu>) !stream.resource<staging>{%c4}
+  // CHECK: util.return %[[STAGED]]
+  util.return %staged : !stream.resource<staging>
+}
+
+} // module

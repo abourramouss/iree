@@ -936,13 +936,6 @@ static bool isSafeToElideTransferOp(
   auto sourceType = cast<IREE::Stream::ResourceType>(source.getType());
   auto resultType = cast<IREE::Stream::ResourceType>(result.getType());
 
-  // Don't elide transfers that change lifetime (usage casts).
-  // These encode important semantic information about how the resource is used.
-  if (sourceType.getLifetime() != resultType.getLifetime()) {
-    LLVM_DEBUG(llvm::dbgs() << "  - transfer changes lifetime; cannot elide\n");
-    return false;
-  }
-
   // Infer source affinity if not explicitly specified.
   // Source affinity inference walks defining ops and checks for result affinity
   // annotations. At this point in the pipeline most ops have explicit
@@ -994,6 +987,47 @@ static bool isSafeToElideTransferOp(
   // Only elide if this is truly a no-op or if we can prove it's safe.
   const bool isSameType =
       (sourceType.getLifetime() == resultType.getLifetime());
+
+  // On unified memory systems, staging transfers are unnecessary because all
+  // device memory is host-accessible. If the transfer only changes lifetime
+  // to staging (for host-side scalar load/store operations) and the topology
+  // indicates unified memory, we can elide the transfer and let the load/store
+  // operate directly on the original resource.
+  //
+  // This avoids generating tiny (e.g. 4-byte) managed memory allocations per
+  // scalar load that cause buffer lifetime issues in CUDA deferred work queues.
+  if (!isSameType && topologyAllowsElision &&
+      resultType.getLifetime() == IREE::Stream::Lifetime::Staging) {
+    // Verify all users of the transfer result can accept non-staging resources.
+    // Currently this covers AsyncLoadOp, AsyncStoreOp, and transfer chains.
+    bool allUsersAcceptNonStaging = true;
+    for (auto &use : transferOp.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      if (isa<IREE::Stream::AsyncLoadOp>(user) ||
+          isa<IREE::Stream::AsyncStoreOp>(user) ||
+          isa<IREE::Stream::AsyncTransferOp>(user)) {
+        continue;
+      }
+      allUsersAcceptNonStaging = false;
+      break;
+    }
+    if (allUsersAcceptNonStaging) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  + staging transfer elided on unified memory "
+                    "(all users accept non-staging resources)\n");
+      return true;
+    }
+    LLVM_DEBUG(llvm::dbgs()
+               << "  - staging transfer has users that require staging\n");
+  }
+
+  // Don't elide transfers that change lifetime (usage casts).
+  // These encode important semantic information about how the resource is used.
+  // Note: staging elision on unified memory is handled above.
+  if (!isSameType) {
+    LLVM_DEBUG(llvm::dbgs() << "  - transfer changes lifetime; cannot elide\n");
+    return false;
+  }
 
   // If the immediate source is a block argument we have to look into the
   // analysis cache to see if it's been classified as a last use/by-value move.
@@ -1072,8 +1106,104 @@ static bool isSafeToElideTransferOp(
   return false;
 }
 
+// Rewrites the affinity of |op| and its transitive operand producers from
+// |fromAffinity| to |toAffinity|. Walks up the def-use chain: for each operand
+// that is a stream resource produced by an op with |fromAffinity|, rewrite that
+// producer and continue upward.
+//
+// This is used when a cross-device transfer is elided on unified_memory
+// topologies. The transfer source chain (e.g. imports and dispatches on the CPU
+// device) should be rewritten to the transfer result device (e.g. GPU) so that
+// buffer allocations stay on the GPU device. Since both devices share the same
+// physical memory on unified_memory topologies, the GPU-allocated buffers are
+// directly accessible from the CPU without any import or mapping.
+//
+// Without this rewrite, buffers get allocated on the CPU device and the GPU
+// kernels try to access them via cuMemHostRegister, which goes stale when the
+// CPU device frees and reuses the same address between invocations, causing
+// CUDA_ERROR_ILLEGAL_ADDRESS at runtime.
+static void rewriteAffinityChainUpward(
+    Operation *op, IREE::Stream::AffinityAttr fromAffinity,
+    IREE::Stream::AffinityAttr toAffinity,
+    llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (!visited.insert(op).second) {
+    return;
+  }
+
+  // Rewrite affinity on this op if it matches the source affinity.
+  if (auto affinityOp = dyn_cast<IREE::Stream::AffinityOpInterface>(op)) {
+    auto currentAffinity = affinityOp.getAffinityAttr();
+    if (currentAffinity == fromAffinity) {
+      LLVM_DEBUG({
+        llvm::dbgs()
+            << "  rewriting affinity on op from " << fromAffinity << " to "
+            << toAffinity << ": ";
+        op->print(llvm::dbgs());
+        llvm::dbgs() << "\n";
+      });
+      affinityOp.setAffinityAttr(toAffinity);
+    }
+  }
+
+  // Walk upward through operands that are stream resources.
+  for (auto operand : op->getOperands()) {
+    if (!isa<IREE::Stream::ResourceType>(operand.getType())) {
+      continue;
+    }
+    if (auto defOp = operand.getDefiningOp()) {
+      if (auto defAffinityOp =
+              dyn_cast<IREE::Stream::AffinityOpInterface>(defOp)) {
+        if (defAffinityOp.getAffinityAttr() == fromAffinity) {
+          rewriteAffinityChainUpward(defOp, fromAffinity, toAffinity, visited);
+        }
+      }
+    }
+  }
+}
+
 // Elides a stream.async.transfer op by replacing all uses with the source.
-static void elideTransferOp(IREE::Stream::AsyncTransferOp transferOp) {
+// When the transfer was between different devices on a unified_memory topology,
+// also rewrites the affinity of the source's producer chain from the source
+// device to the result device so that buffer allocations stay on the result
+// device (typically GPU). On unified_memory topologies, both devices share the
+// same physical memory, so allocating on the GPU device and letting the CPU
+// access it directly is correct and avoids the stale cuMemHostRegister issue.
+static void elideTransferOp(
+    IREE::Stream::AsyncTransferOp transferOp,
+    IREE::Stream::AffinityAttr sourceAffinity = nullptr,
+    IREE::Stream::AffinityAttr resultAffinity = nullptr) {
+  // When eliding a cross-device transfer on unified_memory, rewrite the
+  // CONSUMER chain's affinity from the result device back to the source
+  // device. For example, when eliding GPU->CPU transfer, rewrite the
+  // downstream ops (normalize, matmul) from CPU affinity to GPU affinity.
+  // This ensures all buffer allocations stay on the source device (GPU)
+  // where they were originally produced. On unified_memory topologies,
+  // both devices share the same physical memory.
+  if (sourceAffinity && resultAffinity && sourceAffinity != resultAffinity) {
+    // Rewrite all users of the transfer result from result affinity to source.
+    for (auto &use : transferOp.getResult().getUses()) {
+      Operation *user = use.getOwner();
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      // Walk downward: rewrite this user and its consumers
+      std::function<void(Operation *)> rewriteDownward =
+          [&](Operation *op) {
+            if (!visited.insert(op).second) return;
+            if (auto affinityOp =
+                    dyn_cast<IREE::Stream::AffinityOpInterface>(op)) {
+              if (affinityOp.getAffinityAttr() == resultAffinity) {
+                affinityOp.setAffinityAttr(sourceAffinity);
+              }
+            }
+            for (auto result : op->getResults()) {
+              for (auto &u : result.getUses()) {
+                rewriteDownward(u.getOwner());
+              }
+            }
+          };
+      rewriteDownward(user);
+    }
+  }
+
   transferOp.replaceAllUsesWith(transferOp.getSource());
   transferOp.erase();
 }
@@ -1549,7 +1679,29 @@ static ElisionResults tryElideAsyncCopiesInRegion(
           })
           .Case([&](IREE::Stream::AsyncTransferOp transferOp) {
             if (isSafeToElideTransferOp(transferOp, analysis, topologyAttr)) {
-              elideTransferOp(transferOp);
+              // When eliding a cross-device transfer on a unified_memory
+              // topology, pass the source and result affinities so that the
+              // upstream producer chain can be rewritten from the transfer's
+              // source device to its result device. This keeps buffer
+              // allocations on the result device (e.g. GPU) instead of the
+              // source device (e.g. CPU).
+              IREE::Stream::AffinityAttr sourceAffinity;
+              IREE::Stream::AffinityAttr targetAffinity;
+              if (topologyAttr) {
+                auto srcAttr = transferOp.getSourceAffinityAttr();
+                if (!srcAttr) {
+                  srcAttr = analysis.tryInferValueAffinity(
+                      transferOp.getSource());
+                }
+                auto resAttr = transferOp.getResultAffinityAttr();
+                if (srcAttr && resAttr && srcAttr != resAttr &&
+                    (topologyAttr.hasUnifiedMemory(srcAttr, resAttr) ||
+                     topologyAttr.hasTransparentAccess(srcAttr, resAttr))) {
+                  sourceAffinity = srcAttr;
+                  targetAffinity = resAttr;
+                }
+              }
+              elideTransferOp(transferOp, sourceAffinity, targetAffinity);
               ++results.transfersElided;
             }
             return WalkResult::advance();

@@ -286,6 +286,16 @@ def Stream_AnyStreamResource : AnyTypeOf<[
   Stream_ConstantResource,
 ]>;
 
+// Resource that can be used for host-side scalar loads/stores. On discrete
+// GPU systems this must be a staging resource, but on unified memory systems
+// (e.g., Jetson) any resource lifetime is host-accessible so the staging
+// requirement can be relaxed. This allows the ElideAsyncCopies pass to
+// remove unnecessary staging transfers on unified memory topologies.
+def Stream_HostAccessibleResource : AnyTypeOf<[
+  Stream_StagingResource,
+  Stream_AnyStreamResource,
+]>;
+
 //===----------------------------------------------------------------------===//
 // File resources
 //===----------------------------------------------------------------------===//
