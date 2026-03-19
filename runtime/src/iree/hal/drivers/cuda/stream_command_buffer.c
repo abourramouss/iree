@@ -705,6 +705,13 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
         ((const uint32_t*)constants.data)[i];
   }
 
+  // Skip dispatch if any grid dimension is zero (CUDA rejects grid=(0,...))
+  if (config.workgroup_count[0] == 0 || config.workgroup_count[1] == 0 ||
+      config.workgroup_count[2] == 0) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
+  }
+
   IREE_CUDA_RETURN_AND_END_ZONE_IF_ERROR(
       z0, command_buffer->cuda_symbols,
       cuLaunchKernel(kernel_params->function, config.workgroup_count[0],
