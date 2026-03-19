@@ -475,7 +475,10 @@ class OptimizeIntArithmeticPass
     RewritePatternSet patterns(ctx);
 
     // Populate upstream arith patterns.
-    arith::populateIntRangeOptimizationsPatterns(patterns, solver);
+    // FIXME: Disabled - IntegerRangeAnalysis incorrectly narrows scf.while
+    // loop-carried variables to their initial values, causing buffer
+    // under-allocation for dynamically-growing tensors in loops.
+    // arith::populateIntRangeOptimizationsPatterns(patterns, solver);
 
     if (narrowToI32) {
       arith::populateIntRangeNarrowingPatterns(patterns, solver, {32});
