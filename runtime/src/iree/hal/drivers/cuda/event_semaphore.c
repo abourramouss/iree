@@ -278,7 +278,6 @@ static iree_status_t iree_hal_cuda_semaphore_try_wait_or_acquire_wait_timepoint(
 
   iree_slim_mutex_lock(&semaphore->mutex);
   if (!iree_status_is_ok(semaphore->failure_status)) {
-    // Fastest path: failed; return an error to tell callers to query for it.
     iree_slim_mutex_unlock(&semaphore->mutex);
     IREE_TRACE_ZONE_END(z0);
     return iree_status_from_code(IREE_STATUS_ABORTED);
@@ -326,14 +325,6 @@ static iree_status_t iree_hal_cuda_semaphore_wait(
     return iree_ok_status();
   }
 
-  iree_slim_mutex_lock(&semaphore->mutex);
-  if (semaphore->current_value >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
-    iree_slim_mutex_unlock(&semaphore->mutex);
-    IREE_TRACE_ZONE_END(z0);
-    return iree_make_status(IREE_STATUS_ABORTED);
-  }
-  iree_slim_mutex_unlock(&semaphore->mutex);
-
   // Wait until the timepoint resolves.
   // If satisfied the timepoint is automatically cleaned up and we are done. If
   // the deadline is reached before satisfied then we have to clean it up.
@@ -350,12 +341,6 @@ static iree_status_t iree_hal_cuda_semaphore_wait(
     IREE_TRACE_ZONE_END(z0);
     return status;
   }
-
-  iree_slim_mutex_lock(&semaphore->mutex);
-  if (semaphore->current_value >= IREE_HAL_SEMAPHORE_FAILURE_VALUE) {
-    status = iree_make_status(IREE_STATUS_ABORTED);
-  }
-  iree_slim_mutex_unlock(&semaphore->mutex);
 
   IREE_TRACE_ZONE_END(z0);
   return status;

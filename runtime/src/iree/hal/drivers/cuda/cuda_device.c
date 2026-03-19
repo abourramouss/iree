@@ -1078,6 +1078,7 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
     iree_device_size_t allocation_size, iree_hal_alloca_flags_t flags,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
+  // fprintf(stderr, "[ALLOCA] size=%zu\n", (size_t)allocation_size);
 
   // Only wait on native CUDA semaphores here. Foreign semaphores (e.g. from
   // local-task) are skipped to avoid blocking the VM thread and serializing
@@ -1127,9 +1128,8 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
+  // fprintf(stderr, "[DEALLOCA]\n");
 
-  // Only wait on native CUDA semaphores here. Foreign semaphores (e.g. from
-  // local-task) are skipped to avoid blocking the VM thread.
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
@@ -1141,8 +1141,7 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
           IREE_HAL_WAIT_FLAG_DEFAULT));
     }
   }
-  iree_status_t status = iree_hal_semaphore_list_signal(signal_semaphore_list);
-  return status;
+  return iree_hal_semaphore_list_signal(signal_semaphore_list);
 }
 
 static iree_status_t iree_hal_cuda_device_queue_read(
@@ -1219,6 +1218,7 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     iree_hal_execute_flags_t flags) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
+  // fprintf(stderr, "[EXECUTE] bindings=%zu\n", (size_t)binding_table.count);
 
   // Pre-wait any foreign (non-CUDA) semaphores before enqueueing.
   // The deferred work queue can only handle native CUDA semaphores via device
@@ -1375,6 +1375,7 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
+  // struct timespec _ts0, _ts1, _ts2;
   iree_status_t status = iree_hal_deferred_work_queue_enqueue(
       device->work_queue, iree_hal_cuda_device_collect_tracing_context,
       device->tracing_context, wait_semaphore_list, signal_semaphore_list,
