@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -49,6 +50,172 @@ namespace {
 // 64bit semantics.
 static constexpr uint64_t SAFE_INDEX_UNSIGNED_MAX_VALUE =
     std::numeric_limits<uint32_t>::max();
+
+//===----------------------------------------------------------------------===//
+// Safe constant materialization (guards loop-carried block args)
+//===----------------------------------------------------------------------===//
+
+/// Returns true if the op is a loop-like RegionBranchOpInterface
+/// (has regions that can branch back to each other, i.e., has back-edges).
+static bool isLoopLikeOp(Operation *op) {
+  auto branchOp = dyn_cast<RegionBranchOpInterface>(op);
+  if (!branchOp)
+    return false;
+  for (Region &region : op->getRegions()) {
+    SmallVector<RegionSuccessor> successors;
+    branchOp.getSuccessorRegions(region, successors);
+    for (auto &succ : successors) {
+      if (!succ.isParent() && succ.getSuccessor() != nullptr)
+        return true;
+    }
+  }
+  return false;
+}
+
+/// Returns true if a block is a loop header (has a predecessor that
+/// comes after it in the block list = back-edge in CFG).
+static bool isInCFGLoop(Block *block) {
+  for (Block *pred : block->getPredecessors()) {
+    // A predecessor that appears after this block = back-edge
+    if (pred->getParent() == block->getParent()) {
+      // Check if pred comes after block (back-edge) or block has itself as pred
+      if (pred == block)
+        return true;
+      // Walk the block list to determine ordering
+      for (Block &b : *block->getParent()) {
+        if (&b == block)
+          return false; // block comes first, pred hasn't been seen = forward edge
+        if (&b == pred)
+          return true;  // pred comes first, block comes after = back-edge to block
+      }
+    }
+  }
+  return false;
+}
+
+/// Returns true if an operation is inside a loop (structured or CFG).
+static bool isInsideLoop(Operation *op) {
+  // Check structured loops (scf.while, scf.for, etc.)
+  Operation *parent = op->getParentOp();
+  while (parent) {
+    if (isLoopLikeOp(parent))
+      return true;
+    parent = parent->getParentOp();
+  }
+  // Check CFG loops (cf.br back-edges)
+  Block *block = op->getBlock();
+  if (block && isInCFGLoop(block))
+    return true;
+  // Check if any successor block has this block as predecessor (forward jump to loop body)
+  for (Block *succ : block->getSuccessors()) {
+    if (isInCFGLoop(succ))
+      return true;
+  }
+  return false;
+}
+
+/// Like upstream MaterializeKnownConstantValues but skips block arguments
+/// of loop-like ops (scf.while, scf.for) where IntegerRangeAnalysis may
+/// incorrectly narrow the range to the initial value.
+struct SafeMaterializeKnownConstantValues : public RewritePattern {
+  SafeMaterializeKnownConstantValues(MLIRContext *context,
+                                     DataFlowSolver &solver)
+      : RewritePattern(Pattern::MatchAnyOpTypeTag(), /*benefit=*/1, context),
+        solver(solver) {}
+
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    if (matchPattern(op, m_Constant()))
+      return failure();
+
+    auto needsReplacing = [&](Value v) {
+      auto *result = solver.lookupState<IntegerValueRangeLattice>(v);
+      if (!result || result->getValue().isUninitialized())
+        return false;
+      const ConstantIntRanges &range = result->getValue().getValue();
+      return range.getConstantValue().has_value() && !v.use_empty();
+    };
+
+    // Skip replacing results of ops inside loops — the solver may have
+    // incorrectly narrowed loop-carried values, and derived values
+    // inherit the wrong range.
+    bool hasConstantResults = false;
+    if (!isInsideLoop(op))
+      hasConstantResults = llvm::any_of(op->getResults(), needsReplacing);
+
+    if (op->getNumRegions() == 0)
+      if (!hasConstantResults)
+        return failure();
+
+    bool hasConstantRegionArgs = false;
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region.getBlocks()) {
+        for (BlockArgument &arg : block.getArguments()) {
+          // Skip block args of loop-like ops (ranges may be incorrect)
+          if (!isLoopLikeOp(op) && !isInsideLoop(op))
+            hasConstantRegionArgs |= needsReplacing(arg);
+        }
+      }
+    }
+    if (!hasConstantResults && !hasConstantRegionArgs)
+      return failure();
+
+    if (!isInsideLoop(op)) {
+      bool replacedAll = (op->getNumResults() != 0);
+      for (Value v : op->getResults())
+        replacedAll &=
+            (succeeded(maybeReplaceWithConstant(solver, rewriter, v)) ||
+             v.use_empty());
+      if (replacedAll && isOpTriviallyDead(op)) {
+        rewriter.eraseOp(op);
+        return success();
+      }
+    }
+
+    PatternRewriter::InsertionGuard guard(rewriter);
+    for (Region &region : op->getRegions()) {
+      for (Block &block : region.getBlocks()) {
+        rewriter.setInsertionPointToStart(&block);
+        for (BlockArgument &arg : block.getArguments()) {
+          if (!isLoopLikeOp(op) && !isInsideLoop(op))
+            (void)maybeReplaceWithConstant(solver, rewriter, arg);
+        }
+      }
+    }
+    return success();
+  }
+
+private:
+  DataFlowSolver &solver;
+};
+
+/// Trivial remainder elimination: if the LHS range is strictly within
+/// [0, rhs), the remainder is the LHS itself. Safe for loop-carried
+/// values because it only checks the range, not individual values.
+template <typename RemOp>
+struct DeleteTrivialRem : public OpRewritePattern<RemOp> {
+  DeleteTrivialRem(MLIRContext *context, DataFlowSolver &s)
+      : OpRewritePattern<RemOp>(context), solver(s) {}
+
+  LogicalResult matchAndRewrite(RemOp op,
+                                PatternRewriter &rewriter) const override {
+    auto *lhsRange =
+        solver.lookupState<IntegerValueRangeLattice>(op.getLhs());
+    if (!lhsRange || lhsRange->getValue().isUninitialized())
+      return failure();
+    APInt rhsConstant;
+    if (!matchPattern(op.getRhs(), m_ConstantInt(&rhsConstant)))
+      return failure();
+    const ConstantIntRanges &range = lhsRange->getValue().getValue();
+    if (range.umin().isNonNegative() && range.umax().ult(rhsConstant)) {
+      rewriter.replaceOp(op, op.getLhs());
+      return success();
+    }
+    return failure();
+  }
+
+  DataFlowSolver &solver;
+};
 
 //===----------------------------------------------------------------------===//
 // Signed -> Unsigned patterns
@@ -474,11 +641,13 @@ class OptimizeIntArithmeticPass
     DataFlowListener listener(solver);
     RewritePatternSet patterns(ctx);
 
-    // Populate upstream arith patterns.
-    // FIXME: Disabled - IntegerRangeAnalysis incorrectly narrows scf.while
-    // loop-carried variables to their initial values, causing buffer
-    // under-allocation for dynamically-growing tensors in loops.
-    // arith::populateIntRangeOptimizationsPatterns(patterns, solver);
+    // Populate upstream arith patterns (DeleteTrivialRem only).
+    // We add a guarded version of MaterializeKnownConstantValues below
+    // instead of the upstream one, which incorrectly constant-folds
+    // block arguments of scf.while loops to their initial values.
+    patterns.add<DeleteTrivialRem<arith::RemSIOp>,
+                 DeleteTrivialRem<arith::RemUIOp>>(ctx, solver);
+    patterns.add<SafeMaterializeKnownConstantValues>(ctx, solver);
 
     if (narrowToI32) {
       arith::populateIntRangeNarrowingPatterns(patterns, solver, {32});

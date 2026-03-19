@@ -477,11 +477,30 @@ struct FoldCommandBufferDispatchBufferSubspan : public OpRewritePattern<OpT> {
 
 } // namespace
 
+/// Elide dispatches with zero workgroup count — they do no work.
+/// This prevents CUDA's cuLaunchKernel from rejecting grid=(0,...).
+struct ElideZeroWorkgroupDispatch
+    : public OpRewritePattern<CommandBufferDispatchOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(CommandBufferDispatchOp op,
+                                PatternRewriter &rewriter) const override {
+    for (Value wg : {op.getWorkgroupX(), op.getWorkgroupY(), op.getWorkgroupZ()}) {
+      APInt val;
+      if (matchPattern(wg, m_ConstantInt(&val)) && val.isZero()) {
+        rewriter.eraseOp(op);
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
 void CommandBufferDispatchOp::getCanonicalizationPatterns(
     RewritePatternSet &results, MLIRContext *context) {
   results
-      .insert<FoldCommandBufferDispatchBufferSubspan<CommandBufferDispatchOp>>(
-          context);
+      .insert<FoldCommandBufferDispatchBufferSubspan<CommandBufferDispatchOp>,
+              ElideZeroWorkgroupDispatch>(context);
 }
 
 namespace {
