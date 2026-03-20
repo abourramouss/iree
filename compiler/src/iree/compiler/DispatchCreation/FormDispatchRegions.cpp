@@ -600,7 +600,16 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     };
     if (countNonUnitDims(consumerLoopRanges) >
         countNonUnitDims(rootLoopRanges)) {
-      return false;
+      // Allow fusion when the consumer is elementwise and reads the root's
+      // output as a broadcast (e.g., RMSNorm: reduction [n] -> elementwise [n, d]).
+      // The consumer's extra dimensions are parallel and independent.
+      bool isConsumerElementwise =
+          isa<linalg::GenericOp>(consumerFusionOp.getOperation()) &&
+          isElementwise(
+              cast<linalg::GenericOp>(consumerFusionOp.getOperation()));
+      if (!isConsumerElementwise) {
+        return false;
+      }
     }
   }
 
