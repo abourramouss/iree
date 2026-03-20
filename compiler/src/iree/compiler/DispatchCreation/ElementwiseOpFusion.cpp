@@ -75,20 +75,32 @@ struct GatherFusionPattern final : public OpRewritePattern<tensor::ExtractOp> {
     }
 
     // Check if the producerOp is fusible.
-    // Allow bit extend ops or transpose ops.
-    bool isBitExtend = IREE::LinalgExt::isBitExtendOp(producerOp);
-    bool isTranspose = IREE::LinalgExt::isaTransposeOpInterface(producerOp);
-    if (producerOp.getNumResults() != 1 || !isElementwise(producerOp) ||
-        (!isBitExtend && !isTranspose)) {
+    // Allow any elementwise producer with a single result and projected
+    // permutation indexing maps. This enables fusion of frequency computation
+    // into RoPE, norm scales into matmul inputs, etc.
+    if (producerOp.getNumResults() != 1 || !isElementwise(producerOp)) {
       return rewriter.notifyMatchFailure(producerOp,
                                          "producer op is not fusible");
+    }
+    // Verify all indexing maps are projected permutations (required for
+    // index rewriting below).
+    auto result = cast<OpResult>(extractOp.getTensor());
+    auto resultMap = producerOp.getIndexingMapMatchingResult(result);
+    if (!resultMap.isProjectedPermutation()) {
+      return rewriter.notifyMatchFailure(
+          producerOp, "result indexing map is not a projected permutation");
+    }
+    for (OpOperand &operand : producerOp->getOpOperands()) {
+      auto inputMap = producerOp.getMatchingIndexingMap(&operand);
+      if (!inputMap.isProjectedPermutation()) {
+        return rewriter.notifyMatchFailure(
+            producerOp, "operand indexing map is not a projected permutation");
+      }
     }
 
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPoint(extractOp);
 
-    auto result = cast<OpResult>(extractOp.getTensor());
-    auto resultMap = producerOp.getIndexingMapMatchingResult(result);
     SmallVector<Value> extractOps;
     for (OpOperand &operand : producerOp->getOpOperands()) {
       auto inputMap = producerOp.getMatchingIndexingMap(&operand);
