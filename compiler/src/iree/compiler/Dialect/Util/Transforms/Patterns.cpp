@@ -319,6 +319,17 @@ struct ElideBranchOperandsPattern
       llvm::BitVector elidedArgs(numArgs);
 
       for (unsigned argIndex = 0; argIndex < numArgs; ++argIndex) {
+        // Skip mutable reference types (util.list). Replacing a loop-carried
+        // list block argument with the init value is unsafe because the list
+        // is mutated in-place: list.set inside the loop body modifies the
+        // same object, making the "cycle" non-trivial. After replacement,
+        // dead-store elimination incorrectly removes the initial list.set
+        // because it thinks the value is overwritten before being read.
+        auto argType = block.getArgument(argIndex).getType();
+        if (isa<IREE::Util::ListType>(argType)) {
+          continue;
+        }
+
         // Find the uniform value passed for the operand of all branches.
         Value uniformValue = nullptr;
         for (auto &blockSource : blockSources) {

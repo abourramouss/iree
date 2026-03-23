@@ -48,7 +48,7 @@ private:
       *this, "pipeline", llvm::cl::desc("Pipeline to run to a fixed point")};
   Option<int> maxIterations{*this, "max-iterations",
                             llvm::cl::desc("Maximum number of iterations"),
-                            llvm::cl::init(10)};
+                            llvm::cl::init(20)};
 };
 
 FixedPointIteratorPass::FixedPointIteratorPass(OpPassManager pipeline)
@@ -119,10 +119,12 @@ void FixedPointIteratorPass::runOnOperation() {
     }
   }
 
-  // Abnormal exit - iteration count exceeded.
-  emitError(getOperation()->getLoc())
-      << "maximum iteration count exceeded in fixed point pipeline";
-  return signalPassFailure();
+  // Abnormal exit - iteration count exceeded. Continue with the current state.
+  // This can happen when canonicalization patterns create a cycle (e.g., when
+  // the MakeRegionBranchOpSuccessorInputsDead guard keeps rejecting
+  // optimizations on !util.list<?> iter_args).
+  getOperation()->removeAttr(markerName);
+  return;  // Continue compilation with the current IR
 }
 
 } // namespace

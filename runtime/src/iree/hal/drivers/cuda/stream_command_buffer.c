@@ -595,20 +595,63 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_collective(
   return status;
 }
 
+// Dispatch timing: accumulate per-phase overhead across all calls.
+// Print with iree_hal_cuda_stream_dispatch_dump_timing().
+#include <time.h>
+static _Atomic long long s_dispatch_count = 0;
+static _Atomic long long s_ns_lookup = 0;
+static _Atomic long long s_ns_resource = 0;
+static _Atomic long long s_ns_arena = 0;
+static _Atomic long long s_ns_bindings = 0;
+static _Atomic long long s_ns_launch = 0;
+static _Atomic long long s_ns_total = 0;
+
+static inline long long now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static int s_atexit_registered = 0;
+void iree_hal_cuda_stream_dispatch_dump_timing(void);
+
+__attribute__((constructor)) static void register_dump(void) {
+  if (!s_atexit_registered) {
+    atexit(iree_hal_cuda_stream_dispatch_dump_timing);
+    s_atexit_registered = 1;
+  }
+}
+
+void iree_hal_cuda_stream_dispatch_dump_timing(void) {
+  long long n = s_dispatch_count;
+  if (n == 0) return;
+  fprintf(stderr,
+    "DISPATCH TIMING (%lld calls):\n"
+    "  lookup:   %6lld ns/call\n"
+    "  resource: %6lld ns/call\n"
+    "  arena:    %6lld ns/call\n"
+    "  bindings: %6lld ns/call\n"
+    "  launch:   %6lld ns/call\n"
+    "  TOTAL:    %6lld ns/call = %.3f ms/call\n",
+    n, s_ns_lookup/n, s_ns_resource/n, s_ns_arena/n,
+    s_ns_bindings/n, s_ns_launch/n, s_ns_total/n,
+    (double)(s_ns_total/n) / 1e6);
+  // Reset
+  s_dispatch_count = 0;
+  s_ns_lookup = s_ns_resource = s_ns_arena = 0;
+  s_ns_bindings = s_ns_launch = s_ns_total = 0;
+}
+
 static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_executable_t* executable,
     iree_hal_executable_export_ordinal_t export_ordinal,
     const iree_hal_dispatch_config_t config, iree_const_byte_span_t constants,
     iree_hal_buffer_ref_list_t bindings, iree_hal_dispatch_flags_t flags) {
+  long long t_start = now_ns();
   iree_hal_cuda_stream_command_buffer_t* command_buffer =
       iree_hal_cuda_stream_command_buffer_cast(base_command_buffer);
 
-  // TODO: we can support CUSTOM_DIRECT_ARGUMENTS quite easily here.
-  // Static indirect arguments and parameters are also easy (as we can
-  // map/capture them right now, even if slow as it's a host operation).
-  // Dynamic indirect arguments and parameters require patching or some other
-  // magic that may require recompiling dispatches.
   if (iree_hal_dispatch_uses_custom_arguments(flags)) {
     return iree_make_status(
         IREE_STATUS_UNIMPLEMENTED,
@@ -625,8 +668,8 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
       z0,
       iree_hal_cuda_stream_command_buffer_flush_collectives(command_buffer));
 
-  // Lookup kernel parameters used for side-channeling additional launch
-  // information from the compiler.
+  // Lookup kernel parameters.
+  long long t_lookup = now_ns();
   const iree_hal_cuda_kernel_params_t* kernel_params = NULL;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_cuda_native_executable_lookup_kernel_params(
@@ -641,17 +684,19 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
       kernel_params->debug_info.function_name.data,
       kernel_params->debug_info.function_name.size,
       /*name=*/NULL, 0);
+  long long t_lookup_done = now_ns();
 
+  long long t_resource = now_ns();
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_resource_set_insert(command_buffer->resource_set, 1,
                                        &executable));
+  long long t_resource_done = now_ns();
 
-  // We append push constants to the end of descriptors to form a linear chain
-  // of kernel arguments.
   iree_host_size_t kernel_params_count =
       kernel_params->binding_count + kernel_params->constant_count;
   iree_host_size_t kernel_params_length = kernel_params_count * sizeof(void*);
 
+  long long t_arena = now_ns();
   // TODO: use packed parameters instead of the indirection mechanism - this
   // would avoid additional driver overhead to reflect and repack them all.
   //
@@ -705,13 +750,16 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
         ((const uint32_t*)constants.data)[i];
   }
 
-  // Skip dispatch if any grid dimension is zero (CUDA rejects grid=(0,...))
+  long long t_bindings_done = now_ns();
+
+  // Skip dispatch if any grid dimension is zero
   if (config.workgroup_count[0] == 0 || config.workgroup_count[1] == 0 ||
       config.workgroup_count[2] == 0) {
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
   }
 
+  long long t_launch = now_ns();
   IREE_CUDA_RETURN_AND_END_ZONE_IF_ERROR(
       z0, command_buffer->cuda_symbols,
       cuLaunchKernel(kernel_params->function, config.workgroup_count[0],
@@ -725,10 +773,21 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_dispatch(
                      kernel_params->block_shared_memory_size,
                      command_buffer->cu_stream, params_ptr, NULL),
       "cuLaunchKernel");
+  long long t_launch_done = now_ns();
 
   IREE_HAL_STREAM_TRACE_ZONE_END(command_buffer->tracing_context,
                                  &command_buffer->tracing_event_list,
                                  IREE_HAL_STREAM_TRACING_VERBOSITY_FINE);
+
+  // Accumulate timing
+  long long t_end = now_ns();
+  s_dispatch_count++;
+  s_ns_lookup   += (t_lookup_done - t_lookup);
+  s_ns_resource += (t_resource_done - t_resource);
+  s_ns_arena    += (t_bindings_done - t_arena);
+  s_ns_bindings += (t_bindings_done - t_arena);  // arena+bindings combined
+  s_ns_launch   += (t_launch_done - t_launch);
+  s_ns_total    += (t_end - t_start);
 
   IREE_TRACE_ZONE_END(z0);
   return iree_ok_status();

@@ -1015,6 +1015,14 @@ private:
               *this, Position::forValue(result), DFX::Resolution::REQUIRED);
           getState() ^= resultUsage.getState();
         })
+        .Case([&](IREE::Util::ListSetOp op) {
+          // Value stored in a util.list escapes through a container that the
+          // SSA walker cannot track (list.set → list.get is not an SSA edge).
+          // Mark as external to prevent premature deallocation of the backing
+          // buffer, which would corrupt data when list.get retrieves it in a
+          // later loop iteration.
+          removeAssumedBits(NOT_EXTERNAL);
+        })
         .Default([&](Operation *op) {});
   }
 

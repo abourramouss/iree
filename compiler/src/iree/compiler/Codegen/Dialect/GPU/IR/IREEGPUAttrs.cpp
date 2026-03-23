@@ -2111,8 +2111,15 @@ bool LoweringConfigAttr::hasTilingLevel(unsigned level) const {
   if (level > llvm::to_underlying(GPU::TilingLevel::Lane)) {
     return false;
   }
-  return !getTileSizes(getAttributes(), static_cast<GPU::TilingLevel>(level))
-              .empty();
+  SmallVector<int64_t> sizes =
+      getTileSizes(getAttributes(), static_cast<GPU::TilingLevel>(level));
+  if (sizes.empty()) {
+    return false;
+  }
+  // A tiling level with all-zero tile sizes is effectively absent.
+  // This prevents partial reduction from creating rank-mismatched
+  // init tensors when no actual tiling is needed.
+  return llvm::any_of(sizes, [](int64_t s) { return s != 0; });
 }
 
 bool LoweringConfigAttr::hasWorkgroupTilingLevel() const {
