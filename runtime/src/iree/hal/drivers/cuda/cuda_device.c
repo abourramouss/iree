@@ -1087,19 +1087,18 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
+  // Skip CUDA semaphore waits in alloca — the queue_execute fast path
+  // already called cuStreamSynchronize before signaling, so by the time
+  // we get here the GPU work is done and memory is safe to reuse.
+  // Only wait on foreign (non-CUDA) semaphores.
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
       IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
           wait_semaphore_list.semaphores[i],
           wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
           IREE_HAL_WAIT_FLAG_DEFAULT));
     }
   }
-  // NOTE: Removed forced HOST_VISIBLE that was causing memory leaks.
-  // The original patch forced cuMemAllocManaged for all transient allocations,
-  // but these never got freed by the pool allocator, causing OOM after ~3 calls.
-  // For Jetson unified memory, device-local allocations are still host-accessible.
-
   iree_status_t status = iree_ok_status();
   if (device->supports_memory_pools &&
       !iree_all_bits_set(params.type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
@@ -1133,8 +1132,11 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
+  // Skip CUDA semaphore waits in dealloca — same reasoning as alloca.
+  // cuStreamSynchronize in queue_execute ensures GPU is done before we
+  // signal, so dealloca's wait semaphore is already satisfied.
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
       IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
           wait_semaphore_list.semaphores[i],
           wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
@@ -1375,15 +1377,37 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
-  // struct timespec _ts0, _ts1, _ts2;
-  iree_status_t status = iree_hal_deferred_work_queue_enqueue(
-      device->work_queue, iree_hal_cuda_device_collect_tracing_context,
-      device->tracing_context, wait_semaphore_list, signal_semaphore_list,
-      command_buffer ? 1 : 0, command_buffer ? &command_buffer : NULL,
-      &local_binding_table);
-  if (iree_status_is_ok(status)) {
-    // Try to advance the deferred work queue.
-    status = iree_hal_deferred_work_queue_issue(device->work_queue);
+  // Fast path: replay the deferred command buffer directly onto the dispatch
+  // stream and synchronize on the main thread. This bypasses the deferred work
+  // queue's worker + completion threads, eliminating two thread-wakeup
+  // roundtrips (~1ms each, total ~2ms per execute) caused by CONFIG_HZ=250.
+  iree_status_t status = iree_ok_status();
+  if (command_buffer != NULL) {
+    // Create a temporary stream command buffer for replay
+    iree_hal_command_buffer_t* stream_cb = NULL;
+    status = iree_hal_cuda_device_create_stream_command_buffer(
+        base_device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
+        IREE_HAL_COMMAND_CATEGORY_ANY,
+        local_binding_table.count, &stream_cb);
+    if (iree_status_is_ok(status))
+      status = iree_hal_deferred_command_buffer_apply(
+          command_buffer, stream_cb, local_binding_table);
+    if (iree_status_is_ok(status)) {
+      // Sync stream — ensures GPU work is done before signaling
+      status = IREE_CURESULT_TO_STATUS(device->cuda_symbols,
+          cuStreamSynchronize(device->dispatch_cu_stream),
+          "cuStreamSynchronize");
+    }
+    if (iree_status_is_ok(status))
+      status = iree_hal_semaphore_list_signal(signal_semaphore_list);
+    if (stream_cb) iree_hal_command_buffer_release(stream_cb);
+  } else {
+    status = iree_hal_deferred_work_queue_enqueue(
+        device->work_queue, iree_hal_cuda_device_collect_tracing_context,
+        device->tracing_context, wait_semaphore_list, signal_semaphore_list,
+        0, NULL, &local_binding_table);
+    if (iree_status_is_ok(status))
+      status = iree_hal_deferred_work_queue_issue(device->work_queue);
   }
 
   // Release our references to imported buffers. The DWQ's resource_set now

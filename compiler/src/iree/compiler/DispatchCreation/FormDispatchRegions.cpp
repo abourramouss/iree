@@ -587,7 +587,7 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   // Block fusion if the consumer has more non-unit loops than the producer's
   // fusion group root. This prevents fusing cases where a small reduction
   // result is broadcast to a much larger consumer (e.g., batchn.
-  // patterns). Unit dimensions are ignored..
+  // patterns). Unit dimensions are ignored.
   Operation *rootOp = tracker.getFusionGroup(producer).getRoot();
   if (auto rootFusionOp =
           dyn_cast<IREE::LinalgExt::LinalgFusionOpInterface>(rootOp);
@@ -600,16 +600,7 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     };
     if (countNonUnitDims(consumerLoopRanges) >
         countNonUnitDims(rootLoopRanges)) {
-      // Allow fusion when the consumer is elementwise and reads the root's
-      // output as a broadcast (e.g., RMSNorm: reduction [n] -> elementwise [n, d]).
-      // The consumer's extra dimensions are parallel and independent.
-      bool isConsumerElementwise =
-          isa<linalg::GenericOp>(consumerFusionOp.getOperation()) &&
-          isElementwise(
-              cast<linalg::GenericOp>(consumerFusionOp.getOperation()));
-      if (!isConsumerElementwise) {
-        return false;
-      }
+      return false;
     }
   }
 

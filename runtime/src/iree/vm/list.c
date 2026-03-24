@@ -844,6 +844,12 @@ static iree_status_t iree_vm_list_get_ref(const iree_vm_list_t* list,
                                           iree_host_size_t i,
                                           iree_vm_list_ref_mode_t ref_mode,
                                           iree_vm_ref_t* out_value) {
+  // Debug: correct variant-aware trace
+  {
+    // Removed incorrect debug trace
+    
+    
+  }
   if (i >= list->count) {
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                             "index %" PRIhsz " out of bounds (%" PRIhsz ")", i,
@@ -901,6 +907,7 @@ IREE_API_EXPORT iree_status_t iree_vm_list_get_ref_move(
 static iree_status_t iree_vm_list_set_ref(iree_vm_list_t* list,
                                           iree_host_size_t i, bool is_move,
                                           iree_vm_ref_t* value) {
+  
   if (i >= list->count) {
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                             "index %" PRIhsz " out of bounds (%" PRIhsz ")", i,
