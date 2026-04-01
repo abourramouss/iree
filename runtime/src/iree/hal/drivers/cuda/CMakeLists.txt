@@ -24,6 +24,8 @@ iree_cc_library(
     "cuda_device.c"
     "cuda_device.h"
     "cuda_driver.c"
+    "dispatch_thread.c"
+    "dispatch_thread.h"
     "event_pool.c"
     "event_pool.h"
     "event_semaphore.c"
