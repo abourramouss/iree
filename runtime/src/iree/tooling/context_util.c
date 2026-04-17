@@ -242,8 +242,53 @@ static iree_status_t iree_tooling_load_hal_async_module(
   IREE_ASSERT(device, "require at least one device");
   iree_hal_device_retain(device);
 
-  // Fetch the allocator from the device to pass back to the caller.
+  // Pick an allocator for input buffer allocation. Default to the lead
+  // device's. If any enumerated device's allocator advertises a
+  // DEVICE_LOCAL | HOST_VISIBLE heap, prefer it — memory produced there is
+  // already mapped for GPU access, which saves the first-call
+  // cuMemHostRegister cost in multi-device benchmarks (30-80ms per 224MB
+  // foreign buffer on Jetson).
+  // Pick an allocator for input buffer allocation. Default to the lead
+  // device's. Prefer an allocator that exposes BOTH a pure device-only heap
+  // (DEVICE_LOCAL set, HOST_VISIBLE cleared — characteristic of a real GPU
+  // HAL, not a host-backed local-task allocator) AND a cross-compatible
+  // DEVICE_LOCAL|HOST_VISIBLE heap. That signature picks the CUDA allocator
+  // over local-task in multi-device setups. Using CUDA-allocated inputs
+  // means memory is already GPU-mapped (cuMemHostAlloc path on integrated)
+  // so the first-call cuMemHostRegister cost disappears when the buffer is
+  // later imported into a GPU dispatch.
   iree_hal_allocator_t* device_allocator = iree_hal_device_allocator(device);
+  for (iree_host_size_t i = 0; i < device_list->count; ++i) {
+    iree_hal_allocator_t* candidate =
+        iree_hal_device_allocator(device_list->devices[i]);
+    iree_host_size_t heap_count = 0;
+    iree_hal_allocator_memory_heap_t heaps[8];
+    iree_status_t heap_status = iree_hal_allocator_query_memory_heaps(
+        candidate, IREE_ARRAYSIZE(heaps), heaps, &heap_count);
+    if (!iree_status_is_ok(heap_status)) {
+      iree_status_ignore(heap_status);
+      continue;
+    }
+    bool has_pure_device_heap = false;
+    bool has_cross_heap = false;
+    for (iree_host_size_t j = 0; j < heap_count; ++j) {
+      if (iree_all_bits_set(heaps[j].type,
+                            IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL) &&
+          !iree_any_bit_set(heaps[j].type,
+                            IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+        has_pure_device_heap = true;
+      }
+      if (iree_all_bits_set(heaps[j].type,
+                            IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL |
+                                IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+        has_cross_heap = true;
+      }
+    }
+    if (has_pure_device_heap && has_cross_heap) {
+      device_allocator = candidate;
+      break;
+    }
+  }
   iree_hal_allocator_retain(device_allocator);
 
   // Build a device group from all enumerated devices.
