@@ -1418,21 +1418,81 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
   IREE_TRACE_ZONE_BEGIN(z0);
   // fprintf(stderr, "[EXECUTE] bindings=%zu\n", (size_t)binding_table.count);
 
-  // Pre-wait any foreign (non-CUDA) semaphores before enqueueing.
-  // The deferred work queue can only handle native CUDA semaphores via device
-  // events; foreign semaphores (e.g. from local-task) would stay pending
-  // forever. By pre-waiting them here using the generic vtable dispatch,
-  // they'll be signaled by the time the deferred work queue processes the
-  // action and iree_hal_semaphore_query() will show them as satisfied.
+  // Handle foreign (non-CUDA) wait semaphores by bridging them into CUDA
+  // events on the dispatch stream (same strategy as queue_alloca). The
+  // deferred work queue below can only process CUDA-native waits via device
+  // events; leaving a foreign wait in the list would deadlock because the
+  // foreign HAL wouldn't know to re-issue the DWQ on signal. Instead we:
+  //   1. For each foreign wait, queue a cuLaunchHostFunc + cuEventRecord on
+  //      the bridge stream and cuStreamWaitEvent on the dispatch stream so
+  //      any GPU work enqueued next waits on the foreign-sem completion
+  //      device-side.
+  //   2. Filter the foreign waits out of the list handed to the DWQ.
+  //
+  // The VM submit thread is not blocked by the foreign wait; the blocking
+  // happens on the CUDA runtime's host-callback thread.
+  iree_hal_semaphore_list_t native_wait_list = wait_semaphore_list;
+  iree_hal_semaphore_t* filtered_semaphores_storage[16] = {0};
+  uint64_t filtered_values_storage[16] = {0};
+  iree_hal_semaphore_t** filtered_semaphores_heap = NULL;
+  uint64_t* filtered_values_heap = NULL;
+  iree_host_size_t foreign_count = 0;
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    bool is_cuda =
-        iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i]);
-    if (!is_cuda) {
-      iree_status_t status = iree_hal_semaphore_wait(
-          wait_semaphore_list.semaphores[i],
-          wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
-          IREE_HAL_WAIT_FLAG_DEFAULT);
+    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+      ++foreign_count;
+    }
+  }
+  if (foreign_count > 0 && foreign_count < wait_semaphore_list.count) {
+    // Mixed list — need to filter out the foreign entries.
+    iree_hal_semaphore_t** out_sems = filtered_semaphores_storage;
+    uint64_t* out_vals = filtered_values_storage;
+    iree_host_size_t native_count =
+        wait_semaphore_list.count - foreign_count;
+    if (native_count > IREE_ARRAYSIZE(filtered_semaphores_storage)) {
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_allocator_malloc(
+                  device->host_allocator,
+                  native_count * sizeof(*filtered_semaphores_heap),
+                  (void**)&filtered_semaphores_heap));
+      IREE_RETURN_AND_END_ZONE_IF_ERROR(
+          z0, iree_allocator_malloc(
+                  device->host_allocator,
+                  native_count * sizeof(*filtered_values_heap),
+                  (void**)&filtered_values_heap));
+      out_sems = filtered_semaphores_heap;
+      out_vals = filtered_values_heap;
+    }
+    iree_host_size_t w = 0;
+    for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+      if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+        out_sems[w] = wait_semaphore_list.semaphores[i];
+        out_vals[w] = wait_semaphore_list.payload_values[i];
+        ++w;
+      }
+    }
+    native_wait_list.count = native_count;
+    native_wait_list.semaphores = out_sems;
+    native_wait_list.payload_values = out_vals;
+  } else if (foreign_count == wait_semaphore_list.count) {
+    // All-foreign list — DWQ will get an empty wait list.
+    native_wait_list.count = 0;
+    native_wait_list.semaphores = NULL;
+    native_wait_list.payload_values = NULL;
+  }
+  // Now bridge each foreign wait.
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+      iree_status_t status = iree_hal_cuda_queue_bridge_foreign_wait(
+          device, wait_semaphore_list.semaphores[i],
+          wait_semaphore_list.payload_values[i]);
       if (!iree_status_is_ok(status)) {
+        if (filtered_semaphores_heap) {
+          iree_allocator_free(device->host_allocator,
+                              filtered_semaphores_heap);
+        }
+        if (filtered_values_heap) {
+          iree_allocator_free(device->host_allocator, filtered_values_heap);
+        }
         IREE_TRACE_ZONE_END(z0);
         return status;
       }
@@ -1573,10 +1633,11 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
-  // struct timespec _ts0, _ts1, _ts2;
+  // Hand the DWQ only the native-CUDA waits; foreign waits are bridged
+  // device-side via cuStreamWaitEvent above.
   iree_status_t status = iree_hal_deferred_work_queue_enqueue(
       device->work_queue, iree_hal_cuda_device_collect_tracing_context,
-      device->tracing_context, wait_semaphore_list, signal_semaphore_list,
+      device->tracing_context, native_wait_list, signal_semaphore_list,
       command_buffer ? 1 : 0, command_buffer ? &command_buffer : NULL,
       &local_binding_table);
   if (iree_status_is_ok(status)) {
@@ -1593,6 +1654,12 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
       }
     }
     iree_allocator_free(device->host_allocator, local_bindings);
+  }
+  if (filtered_semaphores_heap) {
+    iree_allocator_free(device->host_allocator, filtered_semaphores_heap);
+  }
+  if (filtered_values_heap) {
+    iree_allocator_free(device->host_allocator, filtered_values_heap);
   }
 
   IREE_TRACE_ZONE_END(z0);
