@@ -1106,20 +1106,28 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   // fprintf(stderr, "[ALLOCA] size=%zu\n", (size_t)allocation_size);
 
-  // Only wait on native CUDA semaphores here. Foreign semaphores (e.g. from
-  // local-task) are skipped to avoid blocking the VM thread and serializing
-  // cross-device execution. Foreign semaphores from the previous iteration's
-  // join fence will be satisfied by the time the GPU work actually executes.
+  // Wait on ALL wait semaphores, native CUDA and foreign alike. The previous
+  // "only wait on CUDA sems here, assume foreign sems are from the prev iter
+  // and will be done by exec time" optimization is unsound: when a GPU alloca
+  // waits on a foreign (e.g. local-task) fence from the same iteration's
+  // cross-device data dep, skipping the wait and signalling our own signal
+  // semaphore immediately races the producer. Concrete case: seq_cpu_first
+  // where a GPU matmul consumes a CPU-produced buffer via stream.cmd.copy;
+  // with 1 CPU worker the copy reads a half-written CPU buffer (observed:
+  // first 21KB correct, remaining 35KB stale zeros).
+  //
+  // For CUDA sems we still want the synchronous wait here because the
+  // deferred work queue action we enqueue below resolves CUDA waits natively
+  // via device events, but pre-waiting keeps the action's ready-list check
+  // simpler.
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
-      IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
-          wait_semaphore_list.semaphores[i],
-          wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
-          IREE_HAL_WAIT_FLAG_DEFAULT));
-    }
+    IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
+        wait_semaphore_list.semaphores[i],
+        wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
+        IREE_HAL_WAIT_FLAG_DEFAULT));
   }
   // Integrated GPU (Tegra/Jetson): when the allocation is potentially
   // accessed from multiple queues (other devices or any-queue), route it
