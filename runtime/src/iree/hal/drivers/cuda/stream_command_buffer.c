@@ -100,8 +100,9 @@ static iree_status_t iree_hal_cuda_stream_resolve_buffer_device_pointer(
   CUdeviceptr device_ptr = 0;
   status = IREE_CURESULT_TO_STATUS(
       command_buffer->cuda_symbols,
-      cuMemHostRegister(host_ptr, (size_t)alloc_size,
-                        CU_MEMHOSTREGISTER_DEVICEMAP),
+      cuMemHostRegister(
+          host_ptr, (size_t)alloc_size,
+          CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_PORTABLE),
       "cuMemHostRegister");
   if (iree_status_is_ok(status)) {
     status = IREE_CURESULT_TO_STATUS(
@@ -533,6 +534,29 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_update_buffer(
   return iree_ok_status();
 }
 
+// Callback data for host-side memcpy inside a CUDA stream.
+typedef struct iree_hal_cuda_stream_host_memcpy_ctx_t {
+  void* dst;
+  const void* src;
+  size_t size;
+} iree_hal_cuda_stream_host_memcpy_ctx_t;
+
+static void CUDA_CB
+iree_hal_cuda_stream_host_memcpy_cb(void* user_data) {
+  iree_hal_cuda_stream_host_memcpy_ctx_t* ctx =
+      (iree_hal_cuda_stream_host_memcpy_ctx_t*)user_data;
+  memcpy(ctx->dst, ctx->src, ctx->size);
+  iree_allocator_free(iree_allocator_system(), ctx);
+}
+
+// Returns the host pointer for a buffer if it is host-accessible, else NULL.
+static void* iree_hal_cuda_buffer_host_pointer_if_mappable(
+    iree_hal_buffer_t* buffer) {
+  iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+  if (!iree_hal_cuda_buffer_isa(allocated)) return NULL;
+  return iree_hal_cuda_buffer_host_pointer(allocated);
+}
+
 static iree_status_t iree_hal_cuda_stream_command_buffer_copy_buffer(
     iree_hal_command_buffer_t* base_command_buffer,
     iree_hal_buffer_ref_t source_ref, iree_hal_buffer_ref_t target_ref,
@@ -544,6 +568,41 @@ static iree_status_t iree_hal_cuda_stream_command_buffer_copy_buffer(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0,
       iree_hal_cuda_stream_command_buffer_flush_collectives(command_buffer));
+
+  // Fast path for integrated-GPU style buffers where both src and dst are
+  // host-accessible (cuMemHostAlloc'd with DEVICEMAP, or cuMemAllocManaged).
+  // On Tegra, cuMemcpyAsync between two such regions is host-synchronous
+  // because the memory is classified as pageable for async purposes, which
+  // stalls the submit thread until the stream drains. Doing a host memcpy
+  // inside a cuLaunchHostFunc preserves stream ordering but doesn't block
+  // the host.
+  void* src_host = iree_hal_cuda_buffer_host_pointer_if_mappable(source_ref.buffer);
+  void* dst_host = iree_hal_cuda_buffer_host_pointer_if_mappable(target_ref.buffer);
+  if (src_host && dst_host) {
+    iree_hal_cuda_stream_host_memcpy_ctx_t* ctx = NULL;
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_allocator_malloc(iree_allocator_system(), sizeof(*ctx),
+                                   (void**)&ctx));
+    ctx->dst = (uint8_t*)dst_host +
+               iree_hal_buffer_byte_offset(target_ref.buffer) +
+               target_ref.offset;
+    ctx->src = (const uint8_t*)src_host +
+               iree_hal_buffer_byte_offset(source_ref.buffer) +
+               source_ref.offset;
+    ctx->size = target_ref.length;
+    iree_status_t s = IREE_CURESULT_TO_STATUS(
+        command_buffer->cuda_symbols,
+        cuLaunchHostFunc(command_buffer->cu_stream,
+                         iree_hal_cuda_stream_host_memcpy_cb, ctx),
+        "cuLaunchHostFunc");
+    if (!iree_status_is_ok(s)) {
+      iree_allocator_free(iree_allocator_system(), ctx);
+      IREE_TRACE_ZONE_END(z0);
+      return s;
+    }
+    IREE_TRACE_ZONE_END(z0);
+    return iree_ok_status();
+  }
 
   CUdeviceptr source_device_buffer = 0;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(

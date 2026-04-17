@@ -1568,7 +1568,8 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
               &device_ptr, host_ptr, 0);
       if (get_result != CUDA_SUCCESS) {
         CUresult reg_result = device->cuda_symbols->cuMemHostRegister(
-            host_ptr, (size_t)alloc_size, CU_MEMHOSTREGISTER_DEVICEMAP);
+            host_ptr, (size_t)alloc_size,
+            CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_PORTABLE);
         if (reg_result != CUDA_SUCCESS &&
             reg_result != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED) {
           status = iree_make_status(
