@@ -16,7 +16,6 @@
 #include "iree/hal/drivers/cuda/cuda_allocator.h"
 #include "iree/hal/drivers/cuda/cuda_buffer.h"
 #include "iree/hal/drivers/cuda/cuda_dynamic_symbols.h"
-#include "iree/hal/drivers/cuda/dispatch_thread.h"
 #include "iree/hal/drivers/cuda/cuda_status_util.h"
 #include "iree/hal/drivers/cuda/event_pool.h"
 #include "iree/hal/drivers/cuda/event_semaphore.h"
@@ -88,9 +87,6 @@ typedef struct iree_hal_cuda_device_t {
 
   // Optional provider used for creating/configuring collective channels.
   iree_hal_channel_provider_t* channel_provider;
-
-  // Dispatch thread for async GPU submission (avoids blocking VM thread).
-  iree_hal_cuda_dispatch_thread_t* dispatch_thread;
 
   iree_hal_device_topology_info_t topology_info;
 } iree_hal_cuda_device_t;
@@ -700,14 +696,6 @@ iree_status_t iree_hal_cuda_device_create(
         host_allocator, &timepoint_pool);
   }
 
-  // Initialize the dispatch thread for async GPU submission.
-  if (iree_status_is_ok(status)) {
-    iree_hal_cuda_device_t* cuda_device =
-        iree_hal_cuda_device_cast(*out_device);
-    status = iree_hal_cuda_dispatch_thread_initialize(
-        host_allocator, &cuda_device->dispatch_thread);
-  }
-
   if (iree_status_is_ok(status)) {
     iree_hal_cuda_device_t* cuda_device =
         iree_hal_cuda_device_cast(*out_device);
@@ -745,10 +733,6 @@ static void iree_hal_cuda_device_destroy(iree_hal_device_t* base_device) {
   iree_allocator_t host_allocator = iree_hal_device_host_allocator(base_device);
   const iree_hal_cuda_dynamic_symbols_t* symbols = device->cuda_symbols;
   IREE_TRACE_ZONE_BEGIN(z0);
-
-  // Destroy the dispatch thread first — it may still be processing work
-  // that touches the CUDA stream.
-  iree_hal_cuda_dispatch_thread_deinitialize(device->dispatch_thread);
 
   // Destroy the pending workload queue.
   iree_hal_deferred_work_queue_destroy(device->work_queue);
@@ -1082,75 +1066,6 @@ iree_hal_cuda_device_query_semaphore_compatibility(
   return IREE_HAL_SEMAPHORE_COMPATIBILITY_HOST_ONLY;
 }
 
-//===----------------------------------------------------------------------===//
-// Alloca dispatch thread callback
-//===----------------------------------------------------------------------===//
-
-typedef struct iree_hal_cuda_alloca_callback_data_t {
-  iree_hal_cuda_device_t* device;
-
-  // Signal semaphore list (deep-copied, each retained).
-  iree_host_size_t signal_count;
-  iree_hal_semaphore_t** signal_semaphores;
-  uint64_t* signal_values;
-
-  // Alloca parameters.
-  iree_hal_buffer_params_t params;
-  iree_device_size_t allocation_size;
-  iree_hal_allocator_pool_t pool;
-  iree_hal_alloca_flags_t flags;
-  iree_hal_buffer_t** out_buffer;
-
-  iree_allocator_t host_allocator;
-} iree_hal_cuda_alloca_callback_data_t;
-
-// Runs on the dispatch thread (via add_dispatch_sync).
-static iree_status_t iree_hal_cuda_alloca_on_thread(void* user_data,
-                                                    iree_status_t status) {
-  iree_hal_cuda_alloca_callback_data_t* data =
-      (iree_hal_cuda_alloca_callback_data_t*)user_data;
-  iree_hal_cuda_device_t* device = data->device;
-
-  if (!iree_status_is_ok(status)) goto cleanup;
-
-  // Set CUDA context for this thread.
-  status = IREE_CURESULT_TO_STATUS(
-      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
-      "cuCtxSetCurrent");
-  if (!iree_status_is_ok(status)) goto cleanup;
-
-  // Perform the allocation.
-  if (device->supports_memory_pools &&
-      !iree_all_bits_set(data->params.type,
-                         IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
-    status = iree_hal_cuda_memory_pools_alloca(
-        &device->memory_pools, device->dispatch_cu_stream, data->pool,
-        data->params, data->allocation_size, data->flags, data->out_buffer);
-  } else {
-    status = iree_hal_allocator_allocate_buffer(
-        iree_hal_device_allocator((iree_hal_device_t*)device), data->params,
-        data->allocation_size, data->out_buffer);
-  }
-
-  // Signal semaphores.
-  if (iree_status_is_ok(status)) {
-    iree_hal_semaphore_list_t signal_list = {
-        .count = data->signal_count,
-        .semaphores = data->signal_semaphores,
-        .payload_values = data->signal_values,
-    };
-    status = iree_hal_semaphore_list_signal(signal_list);
-  }
-
-cleanup:
-  // Release retained semaphores.
-  for (iree_host_size_t i = 0; i < data->signal_count; ++i) {
-    iree_hal_semaphore_release(data->signal_semaphores[i]);
-  }
-  iree_allocator_free(data->host_allocator, data);
-  return status;
-}
-
 // TODO: implement multiple streams; today we only have one and queue_affinity
 //       is ignored.
 // TODO: implement proper semaphores in CUDA to ensure ordering and avoid
@@ -1163,57 +1078,44 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
     iree_device_size_t allocation_size, iree_hal_alloca_flags_t flags,
     iree_hal_buffer_t** IREE_RESTRICT out_buffer) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
+  // fprintf(stderr, "[ALLOCA] size=%zu\n", (size_t)allocation_size);
 
-  // Pre-wait any foreign (non-CUDA) semaphores on the VM thread.
+  // Only wait on native CUDA semaphores here. Foreign semaphores (e.g. from
+  // local-task) are skipped to avoid blocking the VM thread and serializing
+  // cross-device execution. Foreign semaphores from the previous iteration's
+  // join fence will be satisfied by the time the GPU work actually executes.
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
+      "cuCtxSetCurrent"));
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
       IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
           wait_semaphore_list.semaphores[i],
           wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
           IREE_HAL_WAIT_FLAG_DEFAULT));
     }
   }
+  // NOTE: Removed forced HOST_VISIBLE that was causing memory leaks.
+  // The original patch forced cuMemAllocManaged for all transient allocations,
+  // but these never got freed by the pool allocator, causing OOM after ~3 calls.
+  // For Jetson unified memory, device-local allocations are still host-accessible.
 
-  // Package alloca data for the dispatch thread.
-  // We use add_dispatch_sync because the VM needs the buffer pointer back.
-  const iree_host_size_t sem_ptrs_size =
-      signal_semaphore_list.count * sizeof(iree_hal_semaphore_t*);
-  const iree_host_size_t sem_vals_size =
-      signal_semaphore_list.count * sizeof(uint64_t);
-  const iree_host_size_t total_size =
-      sizeof(iree_hal_cuda_alloca_callback_data_t) +
-      sem_ptrs_size + sem_vals_size;
-
-  iree_hal_cuda_alloca_callback_data_t* data = NULL;
-  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
-      device->host_allocator, total_size, (void**)&data));
-  memset(data, 0, total_size);
-
-  uint8_t* ptr = (uint8_t*)data + sizeof(*data);
-  data->device = device;
-  data->host_allocator = device->host_allocator;
-  data->params = params;
-  data->allocation_size = allocation_size;
-  data->pool = pool;
-  data->flags = flags;
-  data->out_buffer = out_buffer;
-
-  // Deep-copy signal semaphore list.
-  data->signal_count = signal_semaphore_list.count;
-  data->signal_semaphores = (iree_hal_semaphore_t**)ptr;
-  ptr += sem_ptrs_size;
-  data->signal_values = (uint64_t*)ptr;
-  for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
-    data->signal_semaphores[i] = signal_semaphore_list.semaphores[i];
-    iree_hal_semaphore_retain(signal_semaphore_list.semaphores[i]);
-    data->signal_values[i] = signal_semaphore_list.payload_values[i];
+  iree_status_t status = iree_ok_status();
+  if (device->supports_memory_pools &&
+      !iree_all_bits_set(params.type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+    status = iree_hal_cuda_memory_pools_alloca(
+        &device->memory_pools, device->dispatch_cu_stream, pool, params,
+        allocation_size, flags, out_buffer);
+  } else {
+    status = iree_hal_allocator_allocate_buffer(
+        iree_hal_device_allocator(base_device), params, allocation_size,
+        out_buffer);
   }
 
-  // Synchronous dispatch: pushes to queue, spin-waits for completion.
-  // The alloca callback runs on the dispatch thread (touching the CUDA stream)
-  // and the VM thread gets the buffer pointer back immediately.
-  return iree_hal_cuda_dispatch_thread_add_dispatch_sync(
-      device->dispatch_thread, iree_hal_cuda_alloca_on_thread, data);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_semaphore_list_signal(signal_semaphore_list);
+  }
+  return status;
 }
 
 // TODO: implement multiple streams; today we only have one and queue_affinity
@@ -1225,10 +1127,14 @@ static iree_status_t iree_hal_cuda_device_queue_dealloca(
     const iree_hal_semaphore_list_t wait_semaphore_list,
     const iree_hal_semaphore_list_t signal_semaphore_list,
     iree_hal_buffer_t* buffer, iree_hal_dealloca_flags_t flags) {
-  // Dealloca doesn't touch the CUDA stream — just wait foreign semaphores
-  // and signal. The dispatch thread handles all actual GPU memory operations.
+  iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
+  // fprintf(stderr, "[DEALLOCA]\n");
+
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
+      "cuCtxSetCurrent"));
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    if (!iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
       IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
           wait_semaphore_list.semaphores[i],
           wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
@@ -1301,157 +1207,6 @@ static void iree_hal_cuda_imported_buffer_release(
   // to avoid costly re-registration (cuMemHostRegister caching fix).
   (void)info->host_ptr;
   iree_allocator_free(iree_allocator_system(), info);
-}
-
-//===----------------------------------------------------------------------===//
-// Dispatch thread callback data + execute_on_thread
-//===----------------------------------------------------------------------===//
-
-// Callback data packaged by queue_execute for the dispatch thread.
-// Single allocation containing all deep-copied semaphore/binding data.
-typedef struct iree_hal_cuda_execute_callback_data_t {
-  iree_hal_cuda_device_t* device;
-  iree_hal_command_buffer_t* command_buffer;  // retained
-
-  // Deep-copied signal semaphore list.
-  iree_host_size_t signal_count;
-  iree_hal_semaphore_t** signal_semaphores;   // each retained
-  uint64_t* signal_values;
-
-  // Deep-copied binding table.
-  iree_hal_buffer_binding_table_t binding_table;
-  iree_hal_buffer_binding_t* binding_storage;  // each buffer retained
-
-  iree_allocator_t host_allocator;
-} iree_hal_cuda_execute_callback_data_t;
-
-static void iree_hal_cuda_execute_callback_data_destroy(
-    iree_hal_cuda_execute_callback_data_t* data) {
-  // Release all retained resources.
-  if (data->command_buffer) {
-    iree_hal_command_buffer_release(data->command_buffer);
-  }
-  for (iree_host_size_t i = 0; i < data->signal_count; ++i) {
-    iree_hal_semaphore_release(data->signal_semaphores[i]);
-  }
-  for (iree_host_size_t i = 0; i < data->binding_table.count; ++i) {
-    if (data->binding_storage[i].buffer) {
-      iree_hal_buffer_release(data->binding_storage[i].buffer);
-    }
-  }
-  iree_allocator_free(data->host_allocator, data);
-}
-
-// Runs on the dispatch thread -- the ONLY thread that touches the CUDA stream.
-static iree_status_t iree_hal_cuda_execute_on_thread(void* user_data,
-                                                     iree_status_t status) {
-  iree_hal_cuda_execute_callback_data_t* data =
-      (iree_hal_cuda_execute_callback_data_t*)user_data;
-  iree_hal_cuda_device_t* device = data->device;
-
-  if (!iree_status_is_ok(status)) {
-    iree_hal_cuda_execute_callback_data_destroy(data);
-    return status;
-  }
-
-  // Set CUDA context for this thread.
-  status = IREE_CURESULT_TO_STATUS(
-      device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
-      "cuCtxSetCurrent");
-
-  // Create a temporary stream command buffer and replay.
-  iree_hal_command_buffer_t* stream_cb = NULL;
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_cuda_device_create_stream_command_buffer(
-        (iree_hal_device_t*)device, IREE_HAL_COMMAND_BUFFER_MODE_ONE_SHOT,
-        IREE_HAL_COMMAND_CATEGORY_ANY, data->binding_table.count, &stream_cb);
-  }
-  if (iree_status_is_ok(status)) {
-    status = iree_hal_deferred_command_buffer_apply(
-        data->command_buffer, stream_cb, data->binding_table);
-  }
-
-  // Synchronize stream -- blocks dispatch thread, NOT the VM thread.
-  if (iree_status_is_ok(status)) {
-    status = IREE_CURESULT_TO_STATUS(
-        device->cuda_symbols,
-        cuStreamSynchronize(device->dispatch_cu_stream),
-        "cuStreamSynchronize");
-  }
-
-  // Signal all semaphores.
-  if (iree_status_is_ok(status)) {
-    iree_hal_semaphore_list_t signal_list = {
-        .count = data->signal_count,
-        .semaphores = data->signal_semaphores,
-        .payload_values = data->signal_values,
-    };
-    status = iree_hal_semaphore_list_signal(signal_list);
-  }
-
-  if (stream_cb) iree_hal_command_buffer_release(stream_cb);
-  iree_hal_cuda_execute_callback_data_destroy(data);
-  return status;
-}
-
-// Packages queue_execute data into a single allocation for the dispatch thread.
-static iree_status_t iree_hal_cuda_make_execute_callback_data(
-    iree_hal_cuda_device_t* device,
-    iree_hal_command_buffer_t* command_buffer,
-    const iree_hal_semaphore_list_t signal_semaphore_list,
-    iree_hal_buffer_binding_table_t binding_table,
-    iree_hal_cuda_execute_callback_data_t** out_data) {
-  *out_data = NULL;
-
-  // Single allocation: struct + signal semaphores + signal values + bindings.
-  const iree_host_size_t sem_ptrs_size =
-      signal_semaphore_list.count * sizeof(iree_hal_semaphore_t*);
-  const iree_host_size_t sem_vals_size =
-      signal_semaphore_list.count * sizeof(uint64_t);
-  const iree_host_size_t bindings_size =
-      binding_table.count * sizeof(iree_hal_buffer_binding_t);
-  const iree_host_size_t total_size =
-      sizeof(iree_hal_cuda_execute_callback_data_t) +
-      sem_ptrs_size + sem_vals_size + bindings_size;
-
-  iree_hal_cuda_execute_callback_data_t* data = NULL;
-  IREE_RETURN_IF_ERROR(iree_allocator_malloc(
-      device->host_allocator, total_size, (void**)&data));
-  memset(data, 0, total_size);
-
-  uint8_t* ptr = (uint8_t*)data + sizeof(*data);
-  data->device = device;
-  data->host_allocator = device->host_allocator;
-
-  // Deep-copy signal semaphore list (retain each semaphore).
-  data->signal_count = signal_semaphore_list.count;
-  data->signal_semaphores = (iree_hal_semaphore_t**)ptr;
-  ptr += sem_ptrs_size;
-  data->signal_values = (uint64_t*)ptr;
-  ptr += sem_vals_size;
-  for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
-    data->signal_semaphores[i] = signal_semaphore_list.semaphores[i];
-    iree_hal_semaphore_retain(signal_semaphore_list.semaphores[i]);
-    data->signal_values[i] = signal_semaphore_list.payload_values[i];
-  }
-
-  // Deep-copy binding table (retain each buffer).
-  data->binding_storage = (iree_hal_buffer_binding_t*)ptr;
-  data->binding_table.count = binding_table.count;
-  data->binding_table.bindings = data->binding_storage;
-  for (iree_host_size_t i = 0; i < binding_table.count; ++i) {
-    data->binding_storage[i] = binding_table.bindings[i];
-    if (binding_table.bindings[i].buffer) {
-      iree_hal_buffer_retain(binding_table.bindings[i].buffer);
-    }
-  }
-
-  // Retain command buffer.
-  data->command_buffer = command_buffer;
-  iree_hal_command_buffer_retain(command_buffer);
-
-  *out_data = data;
-  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_cuda_device_queue_execute(
@@ -1620,32 +1375,19 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
-  // Async dispatch: package all data and push to the dispatch thread.
-  // The dispatch thread is the ONLY thread that touches the CUDA stream.
-  // This prevents two-thread-one-stream races and avoids blocking the VM thread
-  // on cuStreamSynchronize (~4ms per dispatch due to CONFIG_HZ=250).
-  iree_status_t status = iree_ok_status();
-  if (command_buffer != NULL) {
-    iree_hal_cuda_execute_callback_data_t* callback_data = NULL;
-    status = iree_hal_cuda_make_execute_callback_data(
-        device, command_buffer, signal_semaphore_list, local_binding_table,
-        &callback_data);
-    if (iree_status_is_ok(status)) {
-      status = iree_hal_cuda_dispatch_thread_add_dispatch(
-          device->dispatch_thread, iree_hal_cuda_execute_on_thread,
-          callback_data);
-    }
-  } else {
-    status = iree_hal_deferred_work_queue_enqueue(
-        device->work_queue, iree_hal_cuda_device_collect_tracing_context,
-        device->tracing_context, wait_semaphore_list, signal_semaphore_list,
-        0, NULL, &local_binding_table);
-    if (iree_status_is_ok(status))
-      status = iree_hal_deferred_work_queue_issue(device->work_queue);
+  // struct timespec _ts0, _ts1, _ts2;
+  iree_status_t status = iree_hal_deferred_work_queue_enqueue(
+      device->work_queue, iree_hal_cuda_device_collect_tracing_context,
+      device->tracing_context, wait_semaphore_list, signal_semaphore_list,
+      command_buffer ? 1 : 0, command_buffer ? &command_buffer : NULL,
+      &local_binding_table);
+  if (iree_status_is_ok(status)) {
+    // Try to advance the deferred work queue.
+    status = iree_hal_deferred_work_queue_issue(device->work_queue);
   }
 
-  // Release our local references to imported wrapper buffers.
-  // The callback_data now holds its own retained references.
+  // Release our references to imported buffers. The DWQ's resource_set now
+  // holds references to them and will release when the action completes.
   if (local_bindings) {
     for (iree_host_size_t i = 0; i < binding_table.count; ++i) {
       if (local_bindings[i].buffer != binding_table.bindings[i].buffer) {
