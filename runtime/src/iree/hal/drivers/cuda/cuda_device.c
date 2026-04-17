@@ -459,6 +459,12 @@ IREE_API_EXPORT void iree_hal_cuda_device_params_initialize(
   out_params->command_buffer_mode = IREE_HAL_CUDA_COMMAND_BUFFER_MODE_GRAPH;
   out_params->stream_tracing = 0;
   out_params->async_allocations = true;
+  // Keep freed pool memory around instead of returning it to the OS on every
+  // cuMemFreeAsync. Without this, release_threshold defaults to 0 and each
+  // per-iter alloc has to regrow the pool = ~4-6ms on Jetson. UINT64_MAX means
+  // "never release" — trim must be explicit.
+  out_params->memory_pools.device_local.release_threshold = UINT64_MAX;
+  out_params->memory_pools.other.release_threshold = UINT64_MAX;
 }
 
 static iree_status_t iree_hal_cuda_device_check_params(
