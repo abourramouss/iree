@@ -51,6 +51,11 @@ typedef struct iree_hal_cuda_allocator_t {
   // Whether host memory can be registered with CU_MEMHOSTREGISTER_READ_ONLY.
   bool supports_read_only_host_register;
 
+  // Integrated GPU (Tegra/Jetson). On these, CPU and GPU share physical
+  // memory and cuMemAllocManaged is cheap + host-accessible even when
+  // CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS reports 0 (a known quirk).
+  bool is_integrated;
+
   IREE_STATISTICS(iree_hal_allocator_statistics_t statistics;)
 } iree_hal_cuda_allocator_t;
 
@@ -108,6 +113,17 @@ iree_status_t iree_hal_cuda_allocator_create(
                                       ? "has READ_ONLY_HOST_REGISTER_SUPPORTED"
                                       : "no READ_ONLY_HOST_REGISTER_SUPPORTED");
 
+  int is_integrated = 0;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, IREE_CURESULT_TO_STATUS(
+              cuda_symbols,
+              cuDeviceGetAttribute(&is_integrated,
+                                   CU_DEVICE_ATTRIBUTE_INTEGRATED, device),
+              "cuDeviceGetAttribute"));
+  IREE_TRACE_ZONE_APPEND_TEXT(z0, is_integrated
+                                      ? "integrated GPU (unified memory)"
+                                      : "discrete GPU");
+
   iree_hal_cuda_allocator_t* allocator = NULL;
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_allocator_malloc(host_allocator, sizeof(*allocator),
@@ -126,6 +142,7 @@ iree_status_t iree_hal_cuda_allocator_create(
       supports_concurrent_managed_access != 0;
   allocator->supports_read_only_host_register =
       supports_read_only_host_register != 0;
+  allocator->is_integrated = is_integrated != 0;
   *out_allocator = (iree_hal_allocator_t*)allocator;
 
   IREE_TRACE_ZONE_END(z0);
@@ -185,7 +202,8 @@ static iree_status_t iree_hal_cuda_allocator_query_memory_heaps(
   // TODO(benvanik): check CU_DEVICE_ATTRIBUTE_INTEGRATED and return a unified
   // set of heaps (likely still a cached and uncached, at minimum).
   iree_host_size_t count = 3;
-  if (allocator->supports_concurrent_managed_access) {
+  if (allocator->supports_concurrent_managed_access ||
+      allocator->is_integrated) {
     ++count;  // device-local | host-visible
   }
   if (out_count) *out_count = count;
@@ -211,7 +229,8 @@ static iree_status_t iree_hal_cuda_allocator_query_memory_heaps(
       .min_alignment = min_alignment,
   };
 
-  if (allocator->supports_concurrent_managed_access) {
+  if (allocator->supports_concurrent_managed_access ||
+      allocator->is_integrated) {
     // Device-local managed memory with host mapping support:
     heaps[i++] = (iree_hal_allocator_memory_heap_t){
         .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL |
@@ -288,11 +307,44 @@ iree_hal_cuda_allocator_query_buffer_compatibility(
     }
   }
 
+  // Integrated GPU fast path (Tegra/Jetson): CPU and GPU share physical
+  // memory, so a DEVICE_LOCAL request should actually produce buffers that
+  // can also be read/written from the CPU (for cross-device dispatch). We
+  // upgrade to DEVICE_LOCAL | HOST_VISIBLE here, which combined with the
+  // non-concurrent downgrade below routes the allocation through
+  // cuMemHostAlloc(DEVICEMAP) — host-pinned + GPU-mapped, no cuMemHostRegister
+  // needed at dispatch time.
+  //
+  // Mapping is also free on integrated (the allocation is already host-
+  // accessible), so add MAPPING usage so the CPU dispatch can map_range the
+  // buffer to resolve its binding pointer. Without this, USAGE_DEFAULT alone
+  // would fail the cuda_buffer_map_range usage validation.
+  if (allocator->is_integrated &&
+      iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL) &&
+      !iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
+    // HOST_CACHED avoids the CU_MEMHOSTALLOC_WRITECOMBINED flag in the
+    // allocate path below. WC memory is ~100x slower for CPU reads, which
+    // wrecks CPU-side dispatches on integrated GPUs.
+    params->type |= IREE_HAL_MEMORY_TYPE_HOST_VISIBLE |
+                    IREE_HAL_MEMORY_TYPE_HOST_CACHED;
+    // MAPPING_PERSISTENT is required so the local-task backend can map the
+    // buffer via MAPPING_MODE_PERSISTENT when resolving binding pointers for
+    // a CPU dispatch.
+    params->usage |= IREE_HAL_BUFFER_USAGE_MAPPING |
+                     IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT;
+  }
+
   // If concurrent managed access is not supported then make device-local +
   // host-visible allocations fall back to host-local + device-visible
   // page-locked memory. This will be significantly slower for the device to
   // access but the compiler only uses this type for readback staging buffers
   // and it's better to function than function fast.
+  //
+  // Integrated GPUs (Jetson) also take this downgrade — they report
+  // concurrent_managed_access=0 and cuMemAllocManaged pages require
+  // ownership resolution on first kernel access (~1ms/launch), while
+  // cuMemHostAlloc(DEVICEMAP) produces memory that's already pinned and
+  // GPU-mapped with no first-touch stall.
   if (!allocator->supports_concurrent_managed_access &&
       iree_all_bits_set(params->type, IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL |
                                           IREE_HAL_MEMORY_TYPE_HOST_VISIBLE)) {
