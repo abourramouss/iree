@@ -64,6 +64,13 @@ typedef struct iree_hal_cuda_device_t {
   // The CUstream used to issue device kernels and allocations.
   CUstream dispatch_cu_stream;
 
+  // Dedicated stream used to bridge foreign (non-CUDA) semaphore waits into
+  // CUDA events. cuLaunchHostFunc on this stream performs the blocking wait
+  // on a local-task semaphore; a subsequent cuEventRecord produces a CUDA
+  // event that the dispatch stream can wait on via cuStreamWaitEvent. This
+  // keeps the VM submit thread unblocked while honoring cross-device deps.
+  CUstream foreign_bridge_cu_stream;
+
   iree_hal_stream_tracing_context_t* tracing_context;
 
   iree_allocator_t host_allocator;
@@ -692,12 +699,26 @@ iree_status_t iree_hal_cuda_device_create(
         cuda_symbols, cuStreamCreate(&dispatch_stream, CU_STREAM_NON_BLOCKING));
   }
 
+  // Dedicated stream for bridging foreign-semaphore waits into CUDA events.
+  CUstream foreign_bridge_stream = NULL;
+  if (iree_status_is_ok(status)) {
+    status = IREE_CURESULT_TO_STATUS(
+        cuda_symbols,
+        cuStreamCreate(&foreign_bridge_stream, CU_STREAM_NON_BLOCKING));
+  }
+
   if (iree_status_is_ok(status)) {
     status = iree_hal_cuda_device_create_internal(
         driver, identifier, params, device, dispatch_stream, context,
         cuda_symbols, nccl_symbols, host_allocator, out_device);
+    if (iree_status_is_ok(status)) {
+      iree_hal_cuda_device_cast(*out_device)->foreign_bridge_cu_stream =
+          foreign_bridge_stream;
+    }
   } else {
     // Release resources we have acquired thus far.
+    if (foreign_bridge_stream)
+      cuda_symbols->cuStreamDestroy(foreign_bridge_stream);
     if (dispatch_stream) cuda_symbols->cuStreamDestroy(dispatch_stream);
     if (context) cuda_symbols->cuDevicePrimaryCtxRelease(device);
   }
@@ -784,6 +805,10 @@ static void iree_hal_cuda_device_destroy(iree_hal_device_t* base_device) {
   if (device->host_event_pool) iree_event_pool_free(device->host_event_pool);
 
   IREE_CUDA_IGNORE_ERROR(symbols, cuStreamDestroy(device->dispatch_cu_stream));
+  if (device->foreign_bridge_cu_stream) {
+    IREE_CUDA_IGNORE_ERROR(symbols,
+                           cuStreamDestroy(device->foreign_bridge_cu_stream));
+  }
 
   IREE_CUDA_IGNORE_ERROR(symbols, cuDevicePrimaryCtxRelease(device->cu_device));
 
@@ -1092,6 +1117,121 @@ iree_hal_cuda_device_query_semaphore_compatibility(
   return IREE_HAL_SEMAPHORE_COMPATIBILITY_HOST_ONLY;
 }
 
+//===----------------------------------------------------------------------===//
+// Foreign-semaphore bridge
+//===----------------------------------------------------------------------===//
+//
+// Bridges a non-CUDA (foreign, e.g. local-task) semaphore wait into a CUDA
+// event so downstream GPU work can be gated via cuStreamWaitEvent rather than
+// by blocking the VM submit thread.
+
+typedef struct iree_hal_cuda_foreign_wait_ctx_t {
+  iree_hal_semaphore_t* semaphore;
+  uint64_t value;
+} iree_hal_cuda_foreign_wait_ctx_t;
+
+// Runs on the CUDA runtime's host-callback thread. Blocks until the foreign
+// semaphore reaches |value|, then releases the retained semaphore ref.
+static void CUDA_CB
+iree_hal_cuda_foreign_wait_host_callback(void* user_data) {
+  iree_hal_cuda_foreign_wait_ctx_t* ctx =
+      (iree_hal_cuda_foreign_wait_ctx_t*)user_data;
+  iree_status_t status = iree_hal_semaphore_wait(
+      ctx->semaphore, ctx->value, iree_infinite_timeout(),
+      IREE_HAL_WAIT_FLAG_DEFAULT);
+  iree_status_ignore(status);
+  iree_hal_semaphore_release(ctx->semaphore);
+  iree_allocator_free(iree_allocator_system(), ctx);
+}
+
+// Runs on the CUDA runtime's host-callback thread after the bridge event was
+// recorded. Just releases the event.
+static void CUDA_CB
+iree_hal_cuda_foreign_bridge_event_release_callback(void* user_data) {
+  // user_data is a heap-allocated tuple (symbols, event). Free the event.
+  void** pair = (void**)user_data;
+  const iree_hal_cuda_dynamic_symbols_t* symbols =
+      (const iree_hal_cuda_dynamic_symbols_t*)pair[0];
+  CUevent event = (CUevent)pair[1];
+  IREE_CUDA_IGNORE_ERROR(symbols, cuEventDestroy(event));
+  iree_allocator_free(iree_allocator_system(), pair);
+}
+
+// Schedules a blocking wait on |semaphore| for |value| on a dedicated bridge
+// stream, then inserts a cuStreamWaitEvent on the dispatch stream so any
+// subsequent GPU work is ordered behind the foreign-sem completion.
+static iree_status_t iree_hal_cuda_queue_bridge_foreign_wait(
+    iree_hal_cuda_device_t* device, iree_hal_semaphore_t* semaphore,
+    uint64_t value) {
+  // Fast path: already signaled.
+  uint64_t current_value = 0;
+  iree_status_t query_status = iree_hal_semaphore_query(semaphore, &current_value);
+  if (iree_status_is_ok(query_status) && current_value >= value) {
+    return iree_ok_status();
+  }
+  iree_status_ignore(query_status);
+
+  // Create a single-use bridge event. Destroyed via a trailing host callback
+  // on the bridge stream once recording has completed.
+  CUevent bridge_event = NULL;
+  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols,
+      cuEventCreate(&bridge_event, CU_EVENT_DISABLE_TIMING), "cuEventCreate"));
+
+  iree_hal_cuda_foreign_wait_ctx_t* ctx = NULL;
+  IREE_RETURN_IF_ERROR(iree_allocator_malloc(iree_allocator_system(),
+                                             sizeof(*ctx), (void**)&ctx));
+  iree_hal_semaphore_retain(semaphore);
+  ctx->semaphore = semaphore;
+  ctx->value = value;
+
+  // 1. Queue the host-side wait on the bridge stream.
+  iree_status_t status = IREE_CURESULT_TO_STATUS(
+      device->cuda_symbols,
+      cuLaunchHostFunc(device->foreign_bridge_cu_stream,
+                       iree_hal_cuda_foreign_wait_host_callback, ctx),
+      "cuLaunchHostFunc");
+  // 2. Record the event after the host wait completes.
+  if (iree_status_is_ok(status)) {
+    status = IREE_CURESULT_TO_STATUS(
+        device->cuda_symbols,
+        cuEventRecord(bridge_event, device->foreign_bridge_cu_stream),
+        "cuEventRecord");
+  }
+  // 3. Gate the dispatch stream behind the bridge event.
+  if (iree_status_is_ok(status)) {
+    status = IREE_CURESULT_TO_STATUS(
+        device->cuda_symbols,
+        cuStreamWaitEvent(device->dispatch_cu_stream, bridge_event, 0),
+        "cuStreamWaitEvent");
+  }
+  // 4. Schedule event destruction on the bridge stream (after recording).
+  if (iree_status_is_ok(status)) {
+    void** pair = NULL;
+    status = iree_allocator_malloc(iree_allocator_system(), sizeof(void*) * 2,
+                                   (void**)&pair);
+    if (iree_status_is_ok(status)) {
+      pair[0] = (void*)device->cuda_symbols;
+      pair[1] = (void*)bridge_event;
+      status = IREE_CURESULT_TO_STATUS(
+          device->cuda_symbols,
+          cuLaunchHostFunc(device->foreign_bridge_cu_stream,
+                           iree_hal_cuda_foreign_bridge_event_release_callback,
+                           pair),
+          "cuLaunchHostFunc");
+      if (!iree_status_is_ok(status)) {
+        iree_allocator_free(iree_allocator_system(), pair);
+      }
+    }
+  }
+  if (!iree_status_is_ok(status)) {
+    IREE_CUDA_IGNORE_ERROR(device->cuda_symbols, cuEventDestroy(bridge_event));
+    iree_hal_semaphore_release(ctx->semaphore);
+    iree_allocator_free(iree_allocator_system(), ctx);
+  }
+  return status;
+}
+
 // TODO: implement multiple streams; today we only have one and queue_affinity
 //       is ignored.
 // TODO: implement proper semaphores in CUDA to ensure ordering and avoid
@@ -1106,28 +1246,28 @@ static iree_status_t iree_hal_cuda_device_queue_alloca(
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   // fprintf(stderr, "[ALLOCA] size=%zu\n", (size_t)allocation_size);
 
-  // Wait on ALL wait semaphores, native CUDA and foreign alike. The previous
-  // "only wait on CUDA sems here, assume foreign sems are from the prev iter
-  // and will be done by exec time" optimization is unsound: when a GPU alloca
-  // waits on a foreign (e.g. local-task) fence from the same iteration's
-  // cross-device data dep, skipping the wait and signalling our own signal
-  // semaphore immediately races the producer. Concrete case: seq_cpu_first
-  // where a GPU matmul consumes a CPU-produced buffer via stream.cmd.copy;
-  // with 1 CPU worker the copy reads a half-written CPU buffer (observed:
-  // first 21KB correct, remaining 35KB stale zeros).
+  // Honor all wait semaphores, but avoid blocking the VM submit thread on
+  // foreign (non-CUDA) ones. Instead, bridge each foreign sem into a CUDA
+  // event via cuLaunchHostFunc on a dedicated stream; then serialize the
+  // dispatch stream behind a cuStreamWaitEvent for the bridge. The blocking
+  // wait happens on the CUDA runtime's host-callback thread, not the VM.
   //
-  // For CUDA sems we still want the synchronous wait here because the
-  // deferred work queue action we enqueue below resolves CUDA waits natively
-  // via device events, but pre-waiting keeps the action's ready-list check
-  // simpler.
+  // CUDA semaphores still pre-wait host-side (fast, no deadlock risk) —
+  // this keeps the deferred work queue's action-readiness check simple.
   IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
       device->cuda_symbols, cuCtxSetCurrent(device->cu_context),
       "cuCtxSetCurrent"));
   for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
-    IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
-        wait_semaphore_list.semaphores[i],
-        wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
-        IREE_HAL_WAIT_FLAG_DEFAULT));
+    if (iree_hal_cuda_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+      IREE_RETURN_IF_ERROR(iree_hal_semaphore_wait(
+          wait_semaphore_list.semaphores[i],
+          wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
+          IREE_HAL_WAIT_FLAG_DEFAULT));
+    } else {
+      IREE_RETURN_IF_ERROR(iree_hal_cuda_queue_bridge_foreign_wait(
+          device, wait_semaphore_list.semaphores[i],
+          wait_semaphore_list.payload_values[i]));
+    }
   }
   // Integrated GPU (Tegra/Jetson): when the allocation is potentially
   // accessed from multiple queues (other devices or any-queue), route it
