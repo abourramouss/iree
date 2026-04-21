@@ -21,6 +21,15 @@ struct LLVMCPUAssignConstantOrdinalsPass
   void runOnOperation() override {
     IREE::HAL::ExecutableVariantOp variantOp = getOperation();
 
+    // This pass is nested under ExecutableVariantOp in the CPU linking
+    // pipeline, so it runs on every variant in the module — including
+    // variants from other targets in multi-device compiles and variants
+    // that were substituted out and are now external (no inner module).
+    // Skip those: they have no LLVM::GlobalOps for us to reassign.
+    if (variantOp.isExternal()) {
+      return;
+    }
+
     // Get a constant key -> ordinal mapping.
     auto keyOrdinals = variantOp.gatherConstantOrdinals();
     if (keyOrdinals.empty()) {
