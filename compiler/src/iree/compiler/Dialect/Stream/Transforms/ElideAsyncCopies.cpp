@@ -891,30 +891,47 @@ static bool isSafeToElideCloneOp(IREE::Stream::AsyncCloneOp cloneOp,
                << "  ? clone source is a by-value arg; may elide\n");
   }
 
-  // If the clone's source comes from a tensor.import, or the clone's result
-  // feeds into a tensor.export/list.set, the clone separates independently-
-  // owned buffers that may be aliased through container operations (util.list).
-  // The SSA-based mutation analysis cannot track buffer aliasing through
-  // import/export/list operations, so we must preserve these clones.
+  // If the clone's result escapes into a util.list container (directly or
+  // via tensor.export), the stored buffer_view may be read in a future loop
+  // iteration after the source buffer has been overwritten. The SSA-based
+  // mutation analysis cannot track aliasing through util.list, so preserve
+  // these clones. Only gate import/export clones when a util.list is actually
+  // present in the enclosing function — in non-loop code (e.g. multi-device
+  // inference with only imports/exports at the boundary), the clone is safe
+  // to elide.
   if (cloneResultEscapesIntoContainer(cloneOp)) {
     LLVM_DEBUG(llvm::dbgs()
                << "  - clone result escapes into a container; cannot elide\n");
     return false;
   }
-  // Source from tensor.import: buffer shared with a buffer_view in a list.
-  if (auto defOp = cloneOp.getSource().getDefiningOp()) {
-    if (isa<IREE::Stream::TensorImportOp>(defOp)) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "  - clone source is a tensor import; cannot elide\n");
-      return false;
-    }
+  auto parentFunc = cloneOp->getParentOfType<mlir::FunctionOpInterface>();
+  bool hasListOps = false;
+  if (parentFunc) {
+    parentFunc.walk([&](Operation *op) {
+      if (isa<IREE::Util::ListSetOp, IREE::Util::ListGetOp>(op)) {
+        hasListOps = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
   }
-  // Result used by tensor.export: buffer_view may escape via list.set.
-  for (auto &use : cloneOp.getResult().getUses()) {
-    if (isa<IREE::Stream::TensorExportOp>(use.getOwner())) {
-      LLVM_DEBUG(llvm::dbgs()
-                 << "  - clone result is exported; cannot elide\n");
-      return false;
+  if (hasListOps) {
+    // Source from tensor.import: buffer shared with a buffer_view in a list.
+    if (auto defOp = cloneOp.getSource().getDefiningOp()) {
+      if (isa<IREE::Stream::TensorImportOp>(defOp)) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "  - clone source is a tensor import in a list-using "
+                      "function; cannot elide\n");
+        return false;
+      }
+    }
+    // Result used by tensor.export: buffer_view may escape via list.set.
+    for (auto &use : cloneOp.getResult().getUses()) {
+      if (isa<IREE::Stream::TensorExportOp>(use.getOwner())) {
+        LLVM_DEBUG(llvm::dbgs() << "  - clone result is exported in a "
+                                   "list-using function; cannot elide\n");
+        return false;
+      }
     }
   }
 
