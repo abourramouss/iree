@@ -23,7 +23,10 @@ typedef struct iree_hal_cuda_allocator_t {
   // must be at offset 0.
   iree_hal_resource_t resource;
 
-  // Parent device that this allocator is associated with. Unowned.
+  // Parent device that this allocator is associated with. Retained so the
+  // device (and the dynamic symbols it owns) stays alive for as long as the
+  // allocator does — needed when a caching allocator wrapper outlives the
+  // device's own references. Released in iree_hal_cuda_allocator_destroy.
   iree_hal_device_t* parent_device;
 
   // The device that this allocator allocates memory from.
@@ -131,6 +134,7 @@ iree_status_t iree_hal_cuda_allocator_create(
 
   iree_hal_resource_initialize(&iree_hal_cuda_allocator_vtable,
                                &allocator->resource);
+  iree_hal_device_retain(parent_device);
   allocator->parent_device = parent_device;
   allocator->device = device;
   allocator->cu_context = cu_context;
@@ -156,6 +160,7 @@ static void iree_hal_cuda_allocator_destroy(
       iree_hal_cuda_allocator_cast(base_allocator);
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  iree_hal_device_release(allocator->parent_device);
   iree_allocator_free(allocator->host_allocator, allocator);
 
   IREE_TRACE_ZONE_END(z0);
