@@ -1634,11 +1634,38 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
-  // NOTE: fence-aware pool reuse (last-writer stamp at this site) was
-  // designed and prototyped but reverted pending resolution of a semaphore
-  // lifecycle race that produced stochastic deadlocks at higher iteration
-  // counts. See
+  // Stamp the last-writer fence on each CUDA buffer in the binding table so
+  // the caching allocator can skip them on pool-reuse scan if not yet ready.
+  // The first CUDA-native signal semaphore is what completes when the DWQ
+  // action (and hence the writes to these buffers) finishes. Over-stamping
+  // readers is correct: waiting on the last-reader fence before reuse is
+  // strictly safe. See
   // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  //
+  // Limitation: this covers indirect-binding dispatches (binding_capacity>0).
+  // Command buffers with direct bindings (binding_capacity==0) and the
+  // emulated queue_copy/update/fill paths don't populate binding_table; all
+  // pooled transients in our scenario flow through binding_table.
+  iree_hal_semaphore_t* stamp_sema = NULL;
+  uint64_t stamp_value = 0;
+  for (iree_host_size_t i = 0; i < signal_semaphore_list.count; ++i) {
+    if (iree_hal_cuda_semaphore_isa(signal_semaphore_list.semaphores[i])) {
+      stamp_sema = signal_semaphore_list.semaphores[i];
+      stamp_value = signal_semaphore_list.payload_values[i];
+      break;
+    }
+  }
+  if (stamp_sema && local_binding_table.count > 0) {
+    for (iree_host_size_t i = 0; i < local_binding_table.count; ++i) {
+      iree_hal_buffer_t* buffer = local_binding_table.bindings[i].buffer;
+      if (!buffer) continue;
+      iree_hal_buffer_t* allocated = iree_hal_buffer_allocated_buffer(buffer);
+      if (iree_hal_cuda_buffer_isa(allocated)) {
+        iree_hal_cuda_buffer_stamp_last_writer(allocated, stamp_sema,
+                                               stamp_value);
+      }
+    }
+  }
 
   // Hand the DWQ only the native-CUDA waits; foreign waits are bridged
   // device-side via cuStreamWaitEvent above.

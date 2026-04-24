@@ -262,16 +262,12 @@ static iree_status_t iree_hal_cuda_allocator_query_memory_heaps(
   };
 
   // Cached page-locked host-local memory (download). MAPPING_PERSISTENT is
-  // intentionally omitted from allowed_usage so the caching allocator's
-  // subset match on usage fails for requests that set that bit, and those
-  // allocations fall through to cuMemHostAlloc instead of hitting the pool.
-  // The fence-aware pool infrastructure (see iree_hal_buffer_query_ready and
-  // iree_hal_cuda_buffer_stamp_last_writer) is ready to safely handle reuse
-  // here, but the stamp call in queue_execute and this bit are both gated
-  // off pending resolution of a pre-existing stochastic hang in the
-  // heterogeneous scenario benchmark at 15+ iterations (orthogonal to pool
-  // code — reproduces with pool completely disabled). Enable both together
-  // once that race is understood.
+  // advertised so the caching allocator can match and pool cross-device
+  // transients (queue_alloca upgrades their usage to include this bit on
+  // integrated GPUs with peers). Reuse is safe because
+  // iree_hal_cuda_buffer_t carries a last-writer fence stamped at
+  // queue_execute time and pool_find_and_take_buffer does a non-blocking
+  // readiness check before handing out a buffer.
   // See iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
   heaps[i++] = (iree_hal_allocator_memory_heap_t){
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
@@ -280,7 +276,8 @@ static iree_status_t iree_hal_cuda_allocator_query_memory_heaps(
               IREE_HAL_MEMORY_TYPE_HOST_CACHED,
       .allowed_usage = IREE_HAL_BUFFER_USAGE_TRANSFER |
                        IREE_HAL_BUFFER_USAGE_DISPATCH |
-                       IREE_HAL_BUFFER_USAGE_MAPPING,
+                       IREE_HAL_BUFFER_USAGE_MAPPING |
+                       IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
       .max_allocation_size = max_allocation_size,
       .min_alignment = min_alignment,
   };

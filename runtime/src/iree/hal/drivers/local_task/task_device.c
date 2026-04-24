@@ -502,23 +502,92 @@ static iree_status_t iree_hal_task_device_queue_execute(
     iree_hal_execute_flags_t flags) {
   iree_hal_task_device_t* device = iree_hal_task_device_cast(base_device);
 
+  // Cross-device deadlock prevention: if the wait list contains any foreign
+  // (non-task-semaphore) semaphores, resolve them on the submitting thread
+  // (the VM main thread) rather than letting iree_hal_task_queue_wait_cmd
+  // block a worker thread on them. A worker blocked on a foreign CUDA
+  // semaphore cannot execute CPU tasks that would signal other semaphores
+  // CUDA is waiting on — classic AB-BA across backends. See
+  // iree-issues/2026-04-24-heterogeneous-scenario-stochastic-hang.md.
+  //
+  // The throughput cost is small in practice: the foreign wait blocks the
+  // submitting thread only until the cross-device dependency is observable,
+  // and during that window the command could not have started anyway.
+  // Workers stay free for any CPU work that is actually ready.
+  iree_hal_semaphore_t* native_wait_storage[16] = {0};
+  uint64_t native_value_storage[16] = {0};
+  iree_hal_semaphore_t** native_waits = native_wait_storage;
+  uint64_t* native_values = native_value_storage;
+  iree_host_size_t native_count = 0;
+  iree_hal_semaphore_t** native_waits_heap = NULL;
+  uint64_t* native_values_heap = NULL;
+  if (wait_semaphore_list.count > IREE_ARRAYSIZE(native_wait_storage)) {
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+        iree_hal_device_host_allocator(base_device),
+        wait_semaphore_list.count * sizeof(*native_waits),
+        (void**)&native_waits_heap));
+    IREE_RETURN_IF_ERROR(iree_allocator_malloc(
+        iree_hal_device_host_allocator(base_device),
+        wait_semaphore_list.count * sizeof(*native_values),
+        (void**)&native_values_heap));
+    native_waits = native_waits_heap;
+    native_values = native_values_heap;
+  }
+  for (iree_host_size_t i = 0; i < wait_semaphore_list.count; ++i) {
+    if (iree_hal_task_semaphore_isa(wait_semaphore_list.semaphores[i])) {
+      native_waits[native_count] = wait_semaphore_list.semaphores[i];
+      native_values[native_count] = wait_semaphore_list.payload_values[i];
+      ++native_count;
+    } else {
+      // Foreign semaphore — block the submitting thread synchronously so
+      // worker threads never see it.
+      iree_status_t status = iree_hal_semaphore_wait(
+          wait_semaphore_list.semaphores[i],
+          wait_semaphore_list.payload_values[i], iree_infinite_timeout(),
+          IREE_HAL_WAIT_FLAG_DEFAULT);
+      if (!iree_status_is_ok(status)) {
+        if (native_waits_heap) {
+          iree_allocator_free(iree_hal_device_host_allocator(base_device),
+                              native_waits_heap);
+          iree_allocator_free(iree_hal_device_host_allocator(base_device),
+                              native_values_heap);
+        }
+        return status;
+      }
+    }
+  }
+  iree_hal_semaphore_list_t filtered_wait_list = {
+      .count = native_count,
+      .semaphores = native_waits,
+      .payload_values = native_values,
+  };
+
   // NOTE: today we are not discriminating queues based on command type.
   const iree_host_size_t queue_index = iree_hal_task_device_select_queue(
       device, IREE_HAL_COMMAND_CATEGORY_ANY, queue_affinity);
+  iree_status_t status = iree_ok_status();
   if (command_buffer == NULL) {
     // Fast-path for barriers (fork/join/sequence).
-    return iree_hal_task_queue_submit_barrier(&device->queues[queue_index],
-                                              wait_semaphore_list,
-                                              signal_semaphore_list);
+    status = iree_hal_task_queue_submit_barrier(&device->queues[queue_index],
+                                                filtered_wait_list,
+                                                signal_semaphore_list);
+  } else {
+    iree_hal_task_submission_batch_t batch = {
+        .wait_semaphores = filtered_wait_list,
+        .signal_semaphores = signal_semaphore_list,
+        .command_buffer = command_buffer,
+        .binding_table = binding_table,
+    };
+    status = iree_hal_task_queue_submit_commands(
+        &device->queues[queue_index], 1, &batch);
   }
-  iree_hal_task_submission_batch_t batch = {
-      .wait_semaphores = wait_semaphore_list,
-      .signal_semaphores = signal_semaphore_list,
-      .command_buffer = command_buffer,
-      .binding_table = binding_table,
-  };
-  return iree_hal_task_queue_submit_commands(
-      &device->queues[queue_index], 1, &batch);
+  if (native_waits_heap) {
+    iree_allocator_free(iree_hal_device_host_allocator(base_device),
+                        native_waits_heap);
+    iree_allocator_free(iree_hal_device_host_allocator(base_device),
+                        native_values_heap);
+  }
+  return status;
 }
 
 static iree_status_t iree_hal_task_device_queue_flush(
