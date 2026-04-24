@@ -209,6 +209,10 @@ static void iree_hal_caching_allocator_pool_trim_to_size(
     iree_device_size_t allocation_size =
         iree_hal_buffer_allocation_size(dead_buffer);
 
+    // Clear pooling_allocator before dispatching to the device allocator to
+    // prevent recursion through backend destroy paths that honor it.
+    dead_buffer->pooling_allocator = NULL;
+
     // Release the buffer without holding the lock as deallocation can be slow.
     iree_slim_mutex_unlock(&pool->mutex);
     iree_hal_allocator_deallocate_buffer(pool->device_allocator, dead_buffer);
@@ -316,6 +320,12 @@ static void iree_hal_caching_allocator_pool_release(
   // If the buffer didn't fit in the pool we drop it here while we don't hold
   // the lock as deallocations can be very expensive.
   if (buffer) {
+    // Clear the pooling_allocator link before dispatching to the device
+    // allocator. Backends (e.g. CUDA) that honor pooling_allocator in their
+    // vtable->destroy path would otherwise re-enter this function and
+    // recurse. The buffer is being released to the underlying device
+    // allocator now; it is no longer a pooled buffer.
+    buffer->pooling_allocator = NULL;
     iree_slim_mutex_unlock(&pool->mutex);
     iree_hal_allocator_deallocate_buffer(pool->device_allocator, buffer);
     iree_slim_mutex_lock(&pool->mutex);

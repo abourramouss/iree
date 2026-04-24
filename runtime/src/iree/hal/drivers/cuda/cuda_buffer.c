@@ -74,6 +74,26 @@ iree_status_t iree_hal_cuda_buffer_wrap(
 }
 
 static void iree_hal_cuda_buffer_destroy(iree_hal_buffer_t* base_buffer) {
+  // If this buffer was allocated through a pooling allocator, route its
+  // release through that allocator's deallocate_buffer (which will push it
+  // onto a free list when there is capacity) instead of destroying
+  // immediately. Required because this destroy path is reached via
+  // iree_hal_resource_release (resource.h) on refcount=0 from a type-generic
+  // container such as iree_hal_resource_set, which bypasses the
+  // iree_hal_buffer_recycle path that would otherwise check pooling_allocator.
+  // See iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  //
+  // pooling_allocator is intentionally NOT cleared here so buffers returned
+  // to the pool remain poolable across subsequent release cycles. Recursion
+  // on the pool-full device-allocator path is broken by pool_release in
+  // caching_allocator.c, which clears pooling_allocator before dispatching
+  // to the device allocator.
+  if (base_buffer->pooling_allocator) {
+    iree_hal_allocator_deallocate_buffer(base_buffer->pooling_allocator,
+                                         base_buffer);
+    return;
+  }
+
   iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
   iree_allocator_t host_allocator = buffer->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
