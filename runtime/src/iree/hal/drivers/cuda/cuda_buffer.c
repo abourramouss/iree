@@ -19,6 +19,15 @@ typedef struct iree_hal_cuda_buffer_t {
   void* host_ptr;
   CUdeviceptr device_ptr;
   iree_hal_buffer_release_callback_t release_callback;
+  // Last writer fence. Any async op issued via iree_hal_cuda_device_queue_execute
+  // that touches this buffer stamps (sema, value) here using the command
+  // buffer's signal fence. On pool reuse the caching allocator queries the
+  // semaphore non-blockingly and skips this buffer if the fence has not yet
+  // been signaled — the buffer still has pending work from its previous user
+  // and is not safe to hand out. NULL before first stamp; retained while set.
+  // See iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  iree_hal_semaphore_t* last_writer_sema;
+  uint64_t last_writer_value;
 } iree_hal_cuda_buffer_t;
 
 static const iree_hal_buffer_vtable_t iree_hal_cuda_buffer_vtable;
@@ -66,6 +75,8 @@ iree_status_t iree_hal_cuda_buffer_wrap(
     buffer->host_ptr = host_ptr;
     buffer->device_ptr = device_ptr;
     buffer->release_callback = release_callback;
+    buffer->last_writer_sema = NULL;
+    buffer->last_writer_value = 0;
     *out_buffer = &buffer->base;
   }
 
@@ -97,6 +108,10 @@ static void iree_hal_cuda_buffer_destroy(iree_hal_buffer_t* base_buffer) {
   iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
   iree_allocator_t host_allocator = buffer->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
+  if (buffer->last_writer_sema) {
+    iree_hal_semaphore_release(buffer->last_writer_sema);
+    buffer->last_writer_sema = NULL;
+  }
   if (buffer->release_callback.fn) {
     buffer->release_callback.fn(buffer->release_callback.user_data,
                                 base_buffer);
@@ -199,6 +214,39 @@ void iree_hal_cuda_buffer_drop_release_callback(
   buffer->release_callback = iree_hal_buffer_release_callback_null();
 }
 
+void iree_hal_cuda_buffer_stamp_last_writer(iree_hal_buffer_t* base_buffer,
+                                            iree_hal_semaphore_t* sema,
+                                            uint64_t value) {
+  if (!sema) return;
+  iree_hal_cuda_buffer_t* buffer = iree_hal_cuda_buffer_cast(base_buffer);
+  if (buffer->last_writer_sema != sema) {
+    iree_hal_semaphore_retain(sema);
+    if (buffer->last_writer_sema) {
+      iree_hal_semaphore_release(buffer->last_writer_sema);
+    }
+    buffer->last_writer_sema = sema;
+  }
+  if (value > buffer->last_writer_value) {
+    buffer->last_writer_value = value;
+  }
+}
+
+iree_status_t iree_hal_cuda_buffer_query_ready(
+    const iree_hal_buffer_t* base_buffer, bool* IREE_RESTRICT out_ready) {
+  IREE_ASSERT_ARGUMENT(out_ready);
+  const iree_hal_cuda_buffer_t* buffer =
+      iree_hal_cuda_buffer_const_cast(base_buffer);
+  if (!buffer->last_writer_sema) {
+    *out_ready = true;
+    return iree_ok_status();
+  }
+  uint64_t current_value = 0;
+  IREE_RETURN_IF_ERROR(
+      iree_hal_semaphore_query(buffer->last_writer_sema, &current_value));
+  *out_ready = current_value >= buffer->last_writer_value;
+  return iree_ok_status();
+}
+
 bool iree_hal_cuda_buffer_isa(const iree_hal_buffer_t* buffer) {
   return iree_hal_resource_is(buffer, &iree_hal_cuda_buffer_vtable);
 }
@@ -210,4 +258,5 @@ static const iree_hal_buffer_vtable_t iree_hal_cuda_buffer_vtable = {
     .unmap_range = iree_hal_cuda_buffer_unmap_range,
     .invalidate_range = iree_hal_cuda_buffer_invalidate_range,
     .flush_range = iree_hal_cuda_buffer_flush_range,
+    .query_ready = iree_hal_cuda_buffer_query_ready,
 };

@@ -6,6 +6,10 @@
 
 #include "iree/hal/utils/caching_allocator.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "iree/base/threading/mutex.h"
 
 // Default capacity of a pool free list when not specified by the user.
@@ -165,10 +169,33 @@ static iree_hal_buffer_t* iree_hal_caching_allocator_pool_take_buffer_at(
 // returns ownership.
 //
 // Must be called with the pool mutex held.
+// Outcome of a pool acquire attempt. pool_acquire reports one of these
+// regardless of whether it succeeds with a hit or falls through to a fresh
+// allocation; the caller uses this to update the per-allocator counters.
+typedef enum {
+  // Returned an existing buffer from the free list whose last-writer fence
+  // was already signaled.
+  IREE_HAL_CACHING_POOL_HIT_READY = 0,
+  // The free list had no shape-matching buffer; fell through to the
+  // underlying allocator.
+  IREE_HAL_CACHING_POOL_MISS_NO_MATCH,
+  // The free list had shape-matching buffers but all had pending async work
+  // (not yet ready); fell through to the underlying allocator, growing the
+  // pool rather than waiting.
+  IREE_HAL_CACHING_POOL_GREW_ALL_PENDING,
+} iree_hal_caching_pool_outcome_t;
+
+// Scans the free list for a shape-matching buffer whose last-writer fence is
+// signaled. Returns the buffer on hit (out_saw_shape_match is set but
+// unused by the caller in that case). On miss, out_saw_shape_match
+// distinguishes "no shape match at all" from "shape matches but all pending",
+// which the caller turns into an outcome counter.
 static iree_hal_buffer_t* iree_hal_caching_allocator_pool_find_and_take_buffer(
     iree_hal_caching_allocator_pool_t* pool,
     const iree_hal_buffer_params_t* params,
-    iree_device_size_t allocation_size) {
+    iree_device_size_t allocation_size,
+    bool* IREE_RESTRICT out_saw_shape_match) {
+  *out_saw_shape_match = false;
   // Walk backwards so that we check the most recently released buffers first.
   for (int i = (int)pool->free_count - 1; i >= 0; --i) {
     // NOTE: we are not currently checking alignment as we don't really have it.
@@ -179,10 +206,25 @@ static iree_hal_buffer_t* iree_hal_caching_allocator_pool_find_and_take_buffer(
         iree_all_bits_set(iree_hal_buffer_allowed_usage(buffer),
                           params->usage) &&
         iree_hal_buffer_allocation_size(buffer) == allocation_size) {
-      return iree_hal_caching_allocator_pool_take_buffer_at(pool, i);
+      *out_saw_shape_match = true;
+      // Non-blocking readiness check. Backends without async semantics return
+      // ready=true unconditionally; backends with async (CUDA) check the
+      // last-writer fence.
+      // See iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+      bool ready = true;
+      iree_status_t status = iree_hal_buffer_query_ready(buffer, &ready);
+      if (!iree_status_is_ok(status)) {
+        // Query failed — treat as not-ready to be safe. Continue scanning.
+        iree_status_ignore(status);
+        continue;
+      }
+      if (ready) {
+        return iree_hal_caching_allocator_pool_take_buffer_at(pool, i);
+      }
+      // Shape matches but fence not yet signaled; skip and keep scanning.
     }
   }
-  return NULL;  // nothing found
+  return NULL;  // nothing ready
 }
 
 // Trims |pool| down to at most |target_size| of available allocations.
@@ -244,22 +286,31 @@ static void iree_hal_caching_allocator_pool_trim(
 static iree_status_t iree_hal_caching_allocator_pool_acquire(
     iree_hal_caching_allocator_pool_t* pool,
     const iree_hal_buffer_params_t* params, iree_device_size_t allocation_size,
+    iree_hal_caching_pool_outcome_t* IREE_RESTRICT out_outcome,
     iree_hal_buffer_t** out_buffer) {
   IREE_TRACE_ZONE_BEGIN(z0);
   IREE_TRACE_ZONE_APPEND_VALUE_I64(z0, (int64_t)allocation_size);
 
-  // Scan the free list to find an appropriate block.
-  // If found we pop it off the list and return it without needing to allocate.
+  // Scan the free list for a ready shape match.
   iree_slim_mutex_lock(&pool->mutex);
+  bool saw_shape_match = false;
   iree_hal_buffer_t* existing_buffer =
-      iree_hal_caching_allocator_pool_find_and_take_buffer(pool, params,
-                                                           allocation_size);
+      iree_hal_caching_allocator_pool_find_and_take_buffer(
+          pool, params, allocation_size, &saw_shape_match);
   if (!existing_buffer) {
     // We'll need to allocate so we add the size such that it'll be accounted
     // for by other threads allocating at the same time.
     pool->total_allocated_size += allocation_size;
   }
   iree_slim_mutex_unlock(&pool->mutex);
+
+  if (existing_buffer) {
+    *out_outcome = IREE_HAL_CACHING_POOL_HIT_READY;
+  } else if (saw_shape_match) {
+    *out_outcome = IREE_HAL_CACHING_POOL_GREW_ALL_PENDING;
+  } else {
+    *out_outcome = IREE_HAL_CACHING_POOL_MISS_NO_MATCH;
+  }
   if (existing_buffer) {
     // Found a buffer! Return it uninitialized.
     *out_buffer = existing_buffer;
@@ -352,6 +403,16 @@ struct iree_hal_caching_allocator_t {
   // Total number of pools.
   iree_host_size_t pool_count;
 
+  // Counters for pool-hit diagnostics. See
+  // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  // Atomic because the pool is thread-safe; reads are taken without the
+  // pool mutex. pool_hit_waited must stay zero by design — if it ever
+  // increments, the no-wait contract has been violated.
+  iree_atomic_int64_t stat_hit_ready;
+  iree_atomic_int64_t stat_hit_waited;
+  iree_atomic_int64_t stat_grew_all_pending;
+  iree_atomic_int64_t stat_miss_no_match;
+
   // Pointers to pool storage.
   // The count and layout of pools is immutable while each pool has a mutex to
   // guard the pool state.
@@ -431,6 +492,12 @@ iree_status_t iree_hal_caching_allocator_create_with_pools(
   allocator->device_allocator = device_allocator;
   iree_hal_allocator_retain(allocator->device_allocator);
   allocator->pool_count = pool_count;
+  iree_atomic_store(&allocator->stat_hit_ready, 0, iree_memory_order_relaxed);
+  iree_atomic_store(&allocator->stat_hit_waited, 0, iree_memory_order_relaxed);
+  iree_atomic_store(&allocator->stat_grew_all_pending, 0,
+                    iree_memory_order_relaxed);
+  iree_atomic_store(&allocator->stat_miss_no_match, 0,
+                    iree_memory_order_relaxed);
 
   // Initialize each pool.
   uint8_t* pool_ptr = (uint8_t*)allocator + pool_offset;
@@ -607,6 +674,36 @@ static void iree_hal_caching_allocator_destroy(
   iree_allocator_t host_allocator = allocator->host_allocator;
   IREE_TRACE_ZONE_BEGIN(z0);
 
+  // Invariant check: hit_waited must stay zero — the policy is never to wait
+  // on a pending buffer, only to allocate a fresh one. If this ever fires,
+  // someone added a wait path to the free-list scan. See
+  // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  int64_t hit_waited = iree_atomic_load(&allocator->stat_hit_waited,
+                                        iree_memory_order_relaxed);
+  IREE_ASSERT_EQ(hit_waited, 0,
+                 "caching allocator never waits on pending buffers");
+
+  // Diagnostic dump. Gated by env var to keep production quiet. Useful during
+  // validation to see hit-rate, pool-growth frequency, and fresh-alloc count.
+  if (getenv("IREE_HAL_CACHING_ALLOCATOR_STATS")) {
+    int64_t hit_ready = iree_atomic_load(&allocator->stat_hit_ready,
+                                         iree_memory_order_relaxed);
+    int64_t grew = iree_atomic_load(&allocator->stat_grew_all_pending,
+                                    iree_memory_order_relaxed);
+    int64_t miss = iree_atomic_load(&allocator->stat_miss_no_match,
+                                    iree_memory_order_relaxed);
+    int64_t total = hit_ready + grew + miss;
+    fprintf(stderr,
+            "[caching_allocator] allocator=%p total=%" PRId64
+            " hit_ready=%" PRId64 " (%.1f%%) grew_all_pending=%" PRId64
+            " (%.1f%%) miss_no_match=%" PRId64 " (%.1f%%) hit_waited=%" PRId64
+            "\n",
+            (void*)allocator, total, hit_ready,
+            total ? 100.0 * hit_ready / total : 0.0, grew,
+            total ? 100.0 * grew / total : 0.0, miss,
+            total ? 100.0 * miss / total : 0.0, hit_waited);
+  }
+
   // Deinitialize each pool, returning any available resources to the underlying
   // device allocator.
   for (iree_host_size_t i = 0; i < allocator->pool_count; ++i) {
@@ -736,8 +833,26 @@ static iree_status_t iree_hal_caching_allocator_allocate_buffer(
   }
 
   // Acquire the buffer from the pool.
+  iree_hal_caching_pool_outcome_t outcome = IREE_HAL_CACHING_POOL_MISS_NO_MATCH;
   IREE_RETURN_IF_ERROR(iree_hal_caching_allocator_pool_acquire(
-      pool, &compat_params, allocation_size, out_buffer));
+      pool, &compat_params, allocation_size, &outcome, out_buffer));
+
+  // Update hit/miss counters. See
+  // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+  switch (outcome) {
+    case IREE_HAL_CACHING_POOL_HIT_READY:
+      iree_atomic_fetch_add(&allocator->stat_hit_ready, 1,
+                            iree_memory_order_relaxed);
+      break;
+    case IREE_HAL_CACHING_POOL_GREW_ALL_PENDING:
+      iree_atomic_fetch_add(&allocator->stat_grew_all_pending, 1,
+                            iree_memory_order_relaxed);
+      break;
+    case IREE_HAL_CACHING_POOL_MISS_NO_MATCH:
+      iree_atomic_fetch_add(&allocator->stat_miss_no_match, 1,
+                            iree_memory_order_relaxed);
+      break;
+  }
 
   // Point the buffer back to us for deallocation.
   //

@@ -75,6 +75,28 @@ void iree_hal_cuda_buffer_set_allocation_empty(iree_hal_buffer_t* buffer);
 // this call returns and the caller has released its reference.
 void iree_hal_cuda_buffer_drop_release_callback(iree_hal_buffer_t* buffer);
 
+// Stamps |sema|/|value| as the last-writer fence for |buffer|. A subsequent
+// non-blocking readiness check (iree_hal_cuda_buffer_query_ready) can tell
+// whether the buffer is safe to hand out for reuse: ready iff the stamped
+// fence has been signaled. Each call replaces any prior stamp. |sema| is
+// retained while stamped. Passing a NULL |sema| is a no-op.
+//
+// Call at queue_execute time for every buffer touched by the command buffer
+// (over-stamping readers is correct — waiting on the last-reader fence before
+// reuse is strictly safe). Must be a CUDA-native semaphore (foreign sems are
+// bridged elsewhere and do not flow through this path).
+void iree_hal_cuda_buffer_stamp_last_writer(iree_hal_buffer_t* buffer,
+                                            iree_hal_semaphore_t* sema,
+                                            uint64_t value);
+
+// Returns true in |*out_ready| if the last-writer fence of |buffer| has been
+// signaled (or no fence was ever stamped). Non-blocking: calls
+// iree_hal_semaphore_query. Safe to call with any mutex held; does not enter
+// the allocator or block. Returns an error if the query itself fails; on
+// success |*out_ready| is always populated.
+iree_status_t iree_hal_cuda_buffer_query_ready(
+    const iree_hal_buffer_t* buffer, bool* IREE_RESTRICT out_ready);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

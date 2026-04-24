@@ -1634,6 +1634,12 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     }
   }
 
+  // NOTE: fence-aware pool reuse (last-writer stamp at this site) was
+  // designed and prototyped but reverted pending resolution of a semaphore
+  // lifecycle race that produced stochastic deadlocks at higher iteration
+  // counts. See
+  // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+
   // Hand the DWQ only the native-CUDA waits; foreign waits are bridged
   // device-side via cuStreamWaitEvent above.
   iree_status_t status = iree_hal_deferred_work_queue_enqueue(

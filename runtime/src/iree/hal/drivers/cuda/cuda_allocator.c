@@ -261,7 +261,18 @@ static iree_status_t iree_hal_cuda_allocator_query_memory_heaps(
       .min_alignment = min_alignment,
   };
 
-  // Cached page-locked host-local memory (download):
+  // Cached page-locked host-local memory (download). MAPPING_PERSISTENT is
+  // intentionally omitted from allowed_usage so the caching allocator's
+  // subset match on usage fails for requests that set that bit, and those
+  // allocations fall through to cuMemHostAlloc instead of hitting the pool.
+  // The fence-aware pool infrastructure (see iree_hal_buffer_query_ready and
+  // iree_hal_cuda_buffer_stamp_last_writer) is ready to safely handle reuse
+  // here, but the stamp call in queue_execute and this bit are both gated
+  // off pending resolution of a pre-existing stochastic hang in the
+  // heterogeneous scenario benchmark at 15+ iterations (orthogonal to pool
+  // code — reproduces with pool completely disabled). Enable both together
+  // once that race is understood.
+  // See iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
   heaps[i++] = (iree_hal_allocator_memory_heap_t){
       .type = IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
               IREE_HAL_MEMORY_TYPE_HOST_LOCAL |

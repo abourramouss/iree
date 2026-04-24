@@ -774,6 +774,15 @@ IREE_API_EXPORT void iree_hal_buffer_retain(iree_hal_buffer_t* buffer);
 // Releases the given |buffer| from the caller.
 IREE_API_EXPORT void iree_hal_buffer_release(iree_hal_buffer_t* buffer);
 
+// Non-blocking query of whether |buffer| is safe to reuse (has no pending
+// async work from a prior user). Returns true in |*out_ready| if the buffer's
+// last-writer fence (if any) has been signaled, or if the backend has no
+// async semantics. Used by the caching allocator to skip pending buffers at
+// pool-hit time instead of waiting. O(1); never blocks. See
+// iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md.
+IREE_API_EXPORT iree_status_t iree_hal_buffer_query_ready(
+    const iree_hal_buffer_t* buffer, bool* IREE_RESTRICT out_ready);
+
 // Returns a pointer to the buffer containing the actual allocation.
 // The buffer represents a span of the allocated bytes defined by byte_offset
 // and byte_length. If the provided buffer *is* the allocated buffer then the
@@ -1136,6 +1145,16 @@ typedef struct iree_hal_buffer_vtable_t {
   iree_status_t(IREE_API_PTR* flush_range)(
       iree_hal_buffer_t* buffer, iree_device_size_t local_byte_offset,
       iree_device_size_t local_byte_length);
+
+  // Optional: non-blocking query of whether the buffer is safe to reuse.
+  // Backends with async ops that may outlive the host-side buffer refcount
+  // (e.g., CUDA) implement this to query the last-writer fence; others leave
+  // it NULL, which the caching allocator treats as "always ready". Must be
+  // O(1) and must not take any wait; see
+  // iree-issues/2026-04-24-cuda-resource-set-bypasses-pooling-allocator.md
+  // for rationale.
+  iree_status_t(IREE_API_PTR* query_ready)(const iree_hal_buffer_t* buffer,
+                                           bool* IREE_RESTRICT out_ready);
 } iree_hal_buffer_vtable_t;
 static_assert(offsetof(iree_hal_buffer_vtable_t, recycle) == 0,
               "iree_hal_resource_vtable_t expects destroy at offset 0, we want "

@@ -269,6 +269,23 @@ IREE_API_EXPORT void iree_hal_buffer_release(iree_hal_buffer_t* buffer) {
   }
 }
 
+IREE_API_EXPORT iree_status_t iree_hal_buffer_query_ready(
+    const iree_hal_buffer_t* buffer, bool* IREE_RESTRICT out_ready) {
+  IREE_ASSERT_ARGUMENT(out_ready);
+  if (IREE_UNLIKELY(!buffer)) {
+    *out_ready = true;
+    return iree_ok_status();
+  }
+  // Backends without async semantics leave query_ready NULL; treat as ready.
+  const iree_hal_buffer_vtable_t* vtable =
+      (const iree_hal_buffer_vtable_t*)buffer->resource.vtable;
+  if (!vtable->query_ready) {
+    *out_ready = true;
+    return iree_ok_status();
+  }
+  return vtable->query_ready(buffer, out_ready);
+}
+
 IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_memory_type(
     iree_hal_memory_type_t actual_memory_type,
     iree_hal_memory_type_t expected_memory_type) {
