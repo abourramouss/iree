@@ -29,9 +29,15 @@ typedef struct iree_hal_cuda_semaphore_t {
   // The timepoint pool to acquire timepoint objects.
   iree_hal_cuda_timepoint_pool_t* timepoint_pool;
 
-  // The list of pending queue actions that this semaphore need to advance on
-  // new signaled values.
-  iree_hal_deferred_work_queue_t* work_queue;
+  // Every DWQ this semaphore must kick on signal. A semaphore can gate
+  // actions on any queue_affinity bit (since the bit sets that created waits
+  // don't have to match the creator's), so signal/fail fan out to all DWQs
+  // on the owning device. Stored inline; if a device ever grows more DWQs
+  // than this cap we'll need to heap-allocate instead.
+#define IREE_HAL_CUDA_SEMAPHORE_MAX_WORK_QUEUES 4
+  iree_hal_deferred_work_queue_t*
+      work_queues[IREE_HAL_CUDA_SEMAPHORE_MAX_WORK_QUEUES];
+  iree_host_size_t work_queue_count;
 
   // Guards value and status. We expect low contention on semaphores and since
   // iree_slim_mutex_t is (effectively) just a CAS this keeps things simpler
@@ -60,11 +66,15 @@ static iree_hal_cuda_semaphore_t* iree_hal_cuda_semaphore_cast(
 iree_status_t iree_hal_cuda_event_semaphore_create(
     uint64_t initial_value, const iree_hal_cuda_dynamic_symbols_t* symbols,
     iree_hal_cuda_timepoint_pool_t* timepoint_pool,
-    iree_hal_deferred_work_queue_t* work_queue, iree_allocator_t host_allocator,
+    iree_hal_deferred_work_queue_t* const* work_queues,
+    iree_host_size_t work_queue_count, iree_allocator_t host_allocator,
     iree_hal_semaphore_t** out_semaphore) {
   IREE_ASSERT_ARGUMENT(symbols);
   IREE_ASSERT_ARGUMENT(timepoint_pool);
-  IREE_ASSERT_ARGUMENT(work_queue);
+  IREE_ASSERT_ARGUMENT(work_queues);
+  IREE_ASSERT_ARGUMENT(work_queue_count > 0);
+  IREE_ASSERT_ARGUMENT(work_queue_count <=
+                       IREE_HAL_CUDA_SEMAPHORE_MAX_WORK_QUEUES);
   IREE_ASSERT_ARGUMENT(out_semaphore);
   IREE_TRACE_ZONE_BEGIN(z0);
 
@@ -78,7 +88,10 @@ iree_status_t iree_hal_cuda_event_semaphore_create(
   semaphore->host_allocator = host_allocator;
   semaphore->symbols = symbols;
   semaphore->timepoint_pool = timepoint_pool;
-  semaphore->work_queue = work_queue;
+  for (iree_host_size_t i = 0; i < work_queue_count; ++i) {
+    semaphore->work_queues[i] = work_queues[i];
+  }
+  semaphore->work_queue_count = work_queue_count;
   iree_slim_mutex_initialize(&semaphore->mutex);
   semaphore->current_value = initial_value;
   semaphore->failure_status = iree_ok_status();
@@ -152,10 +165,15 @@ static iree_status_t iree_hal_cuda_semaphore_signal(
   // Notify timepoints - note that this must happen outside the lock.
   iree_hal_semaphore_notify(&semaphore->base, new_value, IREE_STATUS_OK);
 
-  // Advance the deferred work queue if possible. This also must happen
-  // outside the lock to avoid nesting.
-  iree_status_t status =
-      iree_hal_deferred_work_queue_issue(semaphore->work_queue);
+  // Advance every deferred work queue the semaphore knows about. A pending
+  // action on any DWQ that was waiting on this value needs to be re-evaluated
+  // now; notifying only one DWQ would leave actions parked on others stuck.
+  iree_status_t status = iree_ok_status();
+  for (iree_host_size_t i = 0; i < semaphore->work_queue_count; ++i) {
+    iree_status_t s =
+        iree_hal_deferred_work_queue_issue(semaphore->work_queues[i]);
+    status = iree_status_join(status, s);
+  }
 
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -191,10 +209,12 @@ static void iree_hal_cuda_semaphore_fail(iree_hal_semaphore_t* base_semaphore,
   iree_hal_semaphore_notify(&semaphore->base, IREE_HAL_SEMAPHORE_FAILURE_VALUE,
                             status_code);
 
-  // Advance the deferred work queue if possible. This also must happen
-  // outside the lock to avoid nesting.
-  status = iree_hal_deferred_work_queue_issue(semaphore->work_queue);
-  iree_status_ignore(status);
+  // Advance every deferred work queue the semaphore knows about.
+  for (iree_host_size_t i = 0; i < semaphore->work_queue_count; ++i) {
+    iree_status_t s =
+        iree_hal_deferred_work_queue_issue(semaphore->work_queues[i]);
+    iree_status_ignore(s);
+  }
 
   IREE_TRACE_ZONE_END(z0);
 }

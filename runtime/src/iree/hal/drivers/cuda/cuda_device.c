@@ -77,6 +77,12 @@ typedef struct iree_hal_cuda_device_t {
   // keeps the VM submit thread unblocked while honoring cross-device deps.
   CUstream foreign_bridge_cu_stream;
 
+  // One tracing context per dispatch stream so kernels launched on
+  // streams[q] are visible in Tracy under their own GPU zone. Otherwise a
+  // single tracing context would only record events for streams[0].
+  iree_hal_stream_tracing_context_t* tracing_contexts[IREE_HAL_CUDA_QUEUE_COUNT];
+  // Legacy alias — external consumers and some existing call sites expect a
+  // single tracing_context handle. Kept pointing at tracing_contexts[0].
   iree_hal_stream_tracing_context_t* tracing_context;
 
   iree_allocator_t host_allocator;
@@ -128,6 +134,10 @@ typedef struct iree_hal_cuda_deferred_work_queue_device_interface_t {
   CUdevice cu_device;
   CUcontext cu_context;
   CUstream dispatch_cu_stream;
+  // Tracing context paired with dispatch_cu_stream; stream command buffers
+  // created by this DWQ record events into it so Tracy shows per-queue
+  // GPU zones.
+  iree_hal_stream_tracing_context_t* tracing_context;
   iree_allocator_t host_allocator;
   const iree_hal_cuda_dynamic_symbols_t* cuda_symbols;
 } iree_hal_cuda_deferred_work_queue_device_interface_t;
@@ -265,8 +275,16 @@ iree_hal_cuda_deferred_work_queue_device_interface_create_stream_command_buffer(
     iree_hal_command_buffer_t** out) {
   iree_hal_cuda_deferred_work_queue_device_interface_t* device_interface =
       (iree_hal_cuda_deferred_work_queue_device_interface_t*)(base_device_interface);
-  return iree_hal_cuda_device_create_stream_command_buffer(
-      device_interface->device, mode, categories, 0, out);
+  // Build the stream command buffer on THIS DWQ's dispatch stream. Going
+  // through iree_hal_cuda_device_create_stream_command_buffer would hardcode
+  // streams[0], collapsing per-queue_affinity routing onto one CUstream.
+  iree_hal_cuda_device_t* device =
+      (iree_hal_cuda_device_t*)device_interface->device;
+  return iree_hal_cuda_stream_command_buffer_create(
+      iree_hal_device_allocator(device_interface->device), device->cuda_symbols,
+      device->nccl_symbols, device_interface->tracing_context, mode, categories,
+      /*binding_capacity=*/0, device_interface->dispatch_cu_stream,
+      &device->block_pool, device->host_allocator, out);
 }
 
 static iree_status_t
@@ -547,36 +565,13 @@ static iree_status_t iree_hal_cuda_device_create_internal(
   }
   device->host_allocator = host_allocator;
 
-  // Create one DWQ + device_interface per dispatch stream so each queue can
-  // be issued/completed independently on its own CUDA stream.
   iree_status_t status = iree_ok_status();
-  for (int q = 0; q < IREE_HAL_CUDA_QUEUE_COUNT; ++q) {
-    iree_hal_cuda_deferred_work_queue_device_interface_t* device_interface;
-    status = iree_allocator_malloc(
-        host_allocator,
-        sizeof(iree_hal_cuda_deferred_work_queue_device_interface_t),
-        (void**)&device_interface);
-    if (!iree_status_is_ok(status)) {
-      iree_hal_device_release((iree_hal_device_t*)device);
-      return status;
-    }
-    device_interface->base.vtable =
-        &iree_hal_cuda_deferred_work_queue_device_interface_vtable;
-    device_interface->cu_context = context;
-    device_interface->cuda_symbols = cuda_symbols;
-    device_interface->cu_device = cu_device;
-    device_interface->device = (iree_hal_device_t*)device;
-    device_interface->dispatch_cu_stream = dispatch_streams[q];
-    device_interface->host_allocator = host_allocator;
 
-    status = iree_hal_deferred_work_queue_create(
-        (iree_hal_deferred_work_queue_device_interface_t*)device_interface,
-        &device->block_pool, host_allocator, &device->work_queues[q]);
-    if (!iree_status_is_ok(status)) break;
-  }
-
-  // Enable tracing for the (currently only) stream - no-op if disabled.
-  if (iree_status_is_ok(status) && device->params.stream_tracing) {
+  // Allocate per-queue tracing contexts BEFORE creating DWQs so each DWQ's
+  // device_interface can point at the matching tracing context. Without
+  // this, stream[q>0] kernels run with no tracing attached and stay
+  // invisible in Tracy.
+  if (device->params.stream_tracing) {
     if (device->params.stream_tracing >=
             IREE_HAL_STREAM_TRACING_VERBOSITY_MAX ||
         device->params.stream_tracing < IREE_HAL_STREAM_TRACING_VERBOSITY_OFF) {
@@ -587,31 +582,71 @@ static iree_status_t iree_hal_cuda_device_create_internal(
           IREE_HAL_STREAM_TRACING_VERBOSITY_MAX);
     }
 
-    iree_hal_cuda_tracing_device_interface_t* tracing_device_interface = NULL;
-    status = iree_allocator_malloc(
-        host_allocator, sizeof(iree_hal_cuda_tracing_device_interface_t),
-        (void**)&tracing_device_interface);
+    // One tracing context per dispatch stream. Each gets its own device
+    // interface so Tracy/IREE's stream tracing can label GPU zones per
+    // queue_affinity bit. Without this, kernels on streams[q>0] run with no
+    // tracing events attached and are invisible in Tracy.
+    for (int q = 0; q < IREE_HAL_CUDA_QUEUE_COUNT; ++q) {
+      iree_hal_cuda_tracing_device_interface_t* tracing_device_interface =
+          NULL;
+      status = iree_allocator_malloc(
+          host_allocator, sizeof(iree_hal_cuda_tracing_device_interface_t),
+          (void**)&tracing_device_interface);
+      if (IREE_UNLIKELY(!iree_status_is_ok(status))) {
+        iree_hal_device_release((iree_hal_device_t*)device);
+        return status;
+      }
 
-    if (IREE_UNLIKELY(!iree_status_is_ok(status))) {
-      iree_hal_device_release((iree_hal_device_t*)device);
-      return status;
+      tracing_device_interface->base.vtable =
+          &iree_hal_cuda_tracing_device_interface_vtable_t;
+      tracing_device_interface->cu_context = context;
+      tracing_device_interface->cu_device = cu_device;
+      tracing_device_interface->dispatch_cu_stream = dispatch_streams[q];
+      tracing_device_interface->host_allocator = host_allocator;
+      tracing_device_interface->cuda_symbols = cuda_symbols;
+
+      status = iree_hal_stream_tracing_context_allocate(
+          (iree_hal_stream_tracing_device_interface_t*)tracing_device_interface,
+          device->identifier, device->params.stream_tracing,
+          &device->block_pool, host_allocator, &device->tracing_contexts[q]);
+      if (!iree_status_is_ok(status)) break;
     }
+    // Keep the legacy single-handle field pointing at queue 0 for call sites
+    // that don't thread queue_affinity through (e.g., graph command buffer
+    // creation).
+    device->tracing_context = device->tracing_contexts[0];
+  }
 
-    tracing_device_interface->base.vtable =
-        &iree_hal_cuda_tracing_device_interface_vtable_t;
-    tracing_device_interface->cu_context = context;
-    tracing_device_interface->cu_device = cu_device;
-    // Tracing is bound to stream 0 (queue 0). Per-stream tracing for every
-    // queue_affinity bit would require per-stream tracing contexts; not
-    // implemented. Tracing only covers stream 0 work.
-    tracing_device_interface->dispatch_cu_stream = dispatch_streams[0];
-    tracing_device_interface->host_allocator = host_allocator;
-    tracing_device_interface->cuda_symbols = cuda_symbols;
+  // Create one DWQ + device_interface per dispatch stream so each queue can
+  // be issued/completed independently on its own CUDA stream. Must come
+  // AFTER tracing context allocation so we can hand each device_interface
+  // the matching per-queue tracing_context.
+  if (iree_status_is_ok(status)) {
+    for (int q = 0; q < IREE_HAL_CUDA_QUEUE_COUNT; ++q) {
+      iree_hal_cuda_deferred_work_queue_device_interface_t* device_interface;
+      status = iree_allocator_malloc(
+          host_allocator,
+          sizeof(iree_hal_cuda_deferred_work_queue_device_interface_t),
+          (void**)&device_interface);
+      if (!iree_status_is_ok(status)) {
+        iree_hal_device_release((iree_hal_device_t*)device);
+        return status;
+      }
+      device_interface->base.vtable =
+          &iree_hal_cuda_deferred_work_queue_device_interface_vtable;
+      device_interface->cu_context = context;
+      device_interface->cuda_symbols = cuda_symbols;
+      device_interface->cu_device = cu_device;
+      device_interface->device = (iree_hal_device_t*)device;
+      device_interface->dispatch_cu_stream = dispatch_streams[q];
+      device_interface->tracing_context = device->tracing_contexts[q];
+      device_interface->host_allocator = host_allocator;
 
-    status = iree_hal_stream_tracing_context_allocate(
-        (iree_hal_stream_tracing_device_interface_t*)tracing_device_interface,
-        device->identifier, device->params.stream_tracing, &device->block_pool,
-        host_allocator, &device->tracing_context);
+      status = iree_hal_deferred_work_queue_create(
+          (iree_hal_deferred_work_queue_device_interface_t*)device_interface,
+          &device->block_pool, host_allocator, &device->work_queues[q]);
+      if (!iree_status_is_ok(status)) break;
+    }
   }
 
   // Integrated (Tegra/Jetson) detection — used in queue_alloca to route
@@ -845,7 +880,13 @@ static void iree_hal_cuda_device_destroy(iree_hal_device_t* base_device) {
   // Destroy memory pools that hold on to reserved memory.
   iree_hal_cuda_memory_pools_deinitialize(&device->memory_pools);
 
-  iree_hal_stream_tracing_context_free(device->tracing_context);
+  for (int q = 0; q < IREE_HAL_CUDA_QUEUE_COUNT; ++q) {
+    if (device->tracing_contexts[q]) {
+      iree_hal_stream_tracing_context_free(device->tracing_contexts[q]);
+      device->tracing_contexts[q] = NULL;
+    }
+  }
+  device->tracing_context = NULL;
 
   // Destroy various pools for synchronization.
   if (device->timepoint_pool) {
@@ -1162,13 +1203,17 @@ static iree_status_t iree_hal_cuda_device_create_semaphore(
     uint64_t initial_value, iree_hal_semaphore_flags_t flags,
     iree_hal_semaphore_t** out_semaphore) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
-  // Route the semaphore's issue-on-signal to the DWQ for this queue.
-  // Cross-queue waiters (rare; VM-level rather than DWQ-level) are handled
-  // by the VM's wait/signal orchestration.
-  int qi = iree_hal_cuda_device_select_queue_index(queue_affinity);
+  (void)queue_affinity;
+  // A semaphore may be waited on by actions enqueued on any DWQ — not just
+  // the one matching queue_affinity at creation time (the HAL creates some
+  // semaphores with IREE_HAL_QUEUE_AFFINITY_ANY, and the same semaphore is
+  // then used by actions on different queues). Give the semaphore every DWQ
+  // on this device so signal-on-fire wakes all of them. Skipping this makes
+  // actions parked on queues other than `ctz(queue_affinity)` hang forever.
   return iree_hal_cuda_event_semaphore_create(
       initial_value, device->cuda_symbols, device->timepoint_pool,
-      device->work_queues[qi], device->host_allocator, out_semaphore);
+      device->work_queues, IREE_HAL_CUDA_QUEUE_COUNT, device->host_allocator,
+      out_semaphore);
 }
 
 static iree_hal_semaphore_compatibility_t
@@ -1182,118 +1227,46 @@ iree_hal_cuda_device_query_semaphore_compatibility(
 // Foreign-semaphore bridge
 //===----------------------------------------------------------------------===//
 //
-// Bridges a non-CUDA (foreign, e.g. local-task) semaphore wait into a CUDA
-// event so downstream GPU work can be gated via cuStreamWaitEvent rather than
-// by blocking the VM submit thread.
-
-typedef struct iree_hal_cuda_foreign_wait_ctx_t {
-  iree_hal_semaphore_t* semaphore;
-  uint64_t value;
-} iree_hal_cuda_foreign_wait_ctx_t;
-
-// Runs on the CUDA runtime's host-callback thread. Blocks until the foreign
-// semaphore reaches |value|, then releases the retained semaphore ref.
-static void CUDA_CB
-iree_hal_cuda_foreign_wait_host_callback(void* user_data) {
-  iree_hal_cuda_foreign_wait_ctx_t* ctx =
-      (iree_hal_cuda_foreign_wait_ctx_t*)user_data;
-  iree_status_t status = iree_hal_semaphore_wait(
-      ctx->semaphore, ctx->value, iree_infinite_timeout(),
-      IREE_HAL_WAIT_FLAG_DEFAULT);
-  iree_status_ignore(status);
-  iree_hal_semaphore_release(ctx->semaphore);
-  iree_allocator_free(iree_allocator_system(), ctx);
-}
-
-// Runs on the CUDA runtime's host-callback thread after the bridge event was
-// recorded. Just releases the event.
-static void CUDA_CB
-iree_hal_cuda_foreign_bridge_event_release_callback(void* user_data) {
-  // user_data is a heap-allocated tuple (symbols, event). Free the event.
-  void** pair = (void**)user_data;
-  const iree_hal_cuda_dynamic_symbols_t* symbols =
-      (const iree_hal_cuda_dynamic_symbols_t*)pair[0];
-  CUevent event = (CUevent)pair[1];
-  IREE_CUDA_IGNORE_ERROR(symbols, cuEventDestroy(event));
-  iree_allocator_free(iree_allocator_system(), pair);
-}
-
-// Schedules a blocking wait on |semaphore| for |value| on a dedicated bridge
-// stream, then inserts a cuStreamWaitEvent on the dispatch stream for
-// |queue_affinity| so any subsequent GPU work on that queue is ordered
-// behind the foreign-sem completion.
+// Resolves a non-CUDA (foreign, e.g. local-task) semaphore wait before the
+// caller submits downstream GPU work.
+//
+// Previous implementation routed this through cuLaunchHostFunc +
+// cuEventRecord on a dedicated bridge stream so the VM submit thread stayed
+// unblocked. That layered a ~24 ms host-side round-trip per bridge because
+// CUDA serializes all host callbacks on a single runtime thread; see
+// iree-issues/2026-04-24-heterogeneous-gpu-idle-gap.md for the breakdown.
+//
+// Since queue_execute always submits the downstream command buffer
+// immediately after this call returns, ordering is preserved by simply
+// waiting synchronously on the submit thread: once this returns OK, the
+// foreign sema has reached |value|, and the subsequent cuLaunchKernel /
+// cuGraphLaunch on the dispatch stream is correctly sequenced behind it
+// without any CUDA-side event or stream-wait. No bridge event, no callback
+// hop, no bridge stream allocation per call.
+//
+// Tradeoff: if a single queue_execute carried many foreign waits we would
+// now resolve them one-by-one on the submit thread instead of letting the
+// callback thread pipeline them. In practice submissions carry at most one
+// foreign wait (the cross-device join) and that was serial to begin with.
 static iree_status_t iree_hal_cuda_queue_bridge_foreign_wait(
     iree_hal_cuda_device_t* device, iree_hal_queue_affinity_t queue_affinity,
     iree_hal_semaphore_t* semaphore, uint64_t value) {
-  int qi = iree_hal_cuda_device_select_queue_index(queue_affinity);
-  CUstream dispatch_stream = device->dispatch_cu_streams[qi];
-  // Fast path: already signaled.
+  (void)device;
+  (void)queue_affinity;
+  // Fast path: already signaled — no wait needed.
   uint64_t current_value = 0;
-  iree_status_t query_status = iree_hal_semaphore_query(semaphore, &current_value);
+  iree_status_t query_status =
+      iree_hal_semaphore_query(semaphore, &current_value);
   if (iree_status_is_ok(query_status) && current_value >= value) {
     return iree_ok_status();
   }
   iree_status_ignore(query_status);
 
-  // Create a single-use bridge event. Destroyed via a trailing host callback
-  // on the bridge stream once recording has completed.
-  CUevent bridge_event = NULL;
-  IREE_RETURN_IF_ERROR(IREE_CURESULT_TO_STATUS(
-      device->cuda_symbols,
-      cuEventCreate(&bridge_event, CU_EVENT_DISABLE_TIMING), "cuEventCreate"));
-
-  iree_hal_cuda_foreign_wait_ctx_t* ctx = NULL;
-  IREE_RETURN_IF_ERROR(iree_allocator_malloc(iree_allocator_system(),
-                                             sizeof(*ctx), (void**)&ctx));
-  iree_hal_semaphore_retain(semaphore);
-  ctx->semaphore = semaphore;
-  ctx->value = value;
-
-  // 1. Queue the host-side wait on the bridge stream.
-  iree_status_t status = IREE_CURESULT_TO_STATUS(
-      device->cuda_symbols,
-      cuLaunchHostFunc(device->foreign_bridge_cu_stream,
-                       iree_hal_cuda_foreign_wait_host_callback, ctx),
-      "cuLaunchHostFunc");
-  // 2. Record the event after the host wait completes.
-  if (iree_status_is_ok(status)) {
-    status = IREE_CURESULT_TO_STATUS(
-        device->cuda_symbols,
-        cuEventRecord(bridge_event, device->foreign_bridge_cu_stream),
-        "cuEventRecord");
-  }
-  // 3. Gate the dispatch stream behind the bridge event.
-  if (iree_status_is_ok(status)) {
-    status = IREE_CURESULT_TO_STATUS(
-        device->cuda_symbols,
-        cuStreamWaitEvent(dispatch_stream, bridge_event, 0),
-        "cuStreamWaitEvent");
-  }
-  // 4. Schedule event destruction on the bridge stream (after recording).
-  if (iree_status_is_ok(status)) {
-    void** pair = NULL;
-    status = iree_allocator_malloc(iree_allocator_system(), sizeof(void*) * 2,
-                                   (void**)&pair);
-    if (iree_status_is_ok(status)) {
-      pair[0] = (void*)device->cuda_symbols;
-      pair[1] = (void*)bridge_event;
-      status = IREE_CURESULT_TO_STATUS(
-          device->cuda_symbols,
-          cuLaunchHostFunc(device->foreign_bridge_cu_stream,
-                           iree_hal_cuda_foreign_bridge_event_release_callback,
-                           pair),
-          "cuLaunchHostFunc");
-      if (!iree_status_is_ok(status)) {
-        iree_allocator_free(iree_allocator_system(), pair);
-      }
-    }
-  }
-  if (!iree_status_is_ok(status)) {
-    IREE_CUDA_IGNORE_ERROR(device->cuda_symbols, cuEventDestroy(bridge_event));
-    iree_hal_semaphore_release(ctx->semaphore);
-    iree_allocator_free(iree_allocator_system(), ctx);
-  }
-  return status;
+  // Block the submit thread until the foreign semaphore catches up. On
+  // return the caller submits its command buffer; the dispatch stream FIFO
+  // handles the rest.
+  return iree_hal_semaphore_wait(semaphore, value, iree_infinite_timeout(),
+                                 IREE_HAL_WAIT_FLAG_DEFAULT);
 }
 
 // TODO: implement multiple streams; today we only have one and queue_affinity
@@ -1481,7 +1454,6 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
     iree_hal_execute_flags_t flags) {
   iree_hal_cuda_device_t* device = iree_hal_cuda_device_cast(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
-  // fprintf(stderr, "[EXECUTE] bindings=%zu\n", (size_t)binding_table.count);
 
   // Handle foreign (non-CUDA) wait semaphores by bridging them into CUDA
   // events on the dispatch stream (same strategy as queue_alloca). The
@@ -1738,7 +1710,8 @@ static iree_status_t iree_hal_cuda_device_queue_execute(
   int exec_qi = iree_hal_cuda_device_select_queue_index(queue_affinity);
   iree_status_t status = iree_hal_deferred_work_queue_enqueue(
       device->work_queues[exec_qi],
-      iree_hal_cuda_device_collect_tracing_context, device->tracing_context,
+      iree_hal_cuda_device_collect_tracing_context,
+      device->tracing_contexts[exec_qi],
       native_wait_list, signal_semaphore_list,
       command_buffer ? 1 : 0, command_buffer ? &command_buffer : NULL,
       &local_binding_table);

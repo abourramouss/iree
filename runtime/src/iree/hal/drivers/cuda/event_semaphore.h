@@ -25,14 +25,18 @@ extern "C" {
 // timepoints along the timeline under the hood. Those timepoints will be
 // allocated from the |timepoint_pool|.
 //
-// This semaphore is meant to be used together with a pending queue actions; it
-// may advance the given |work_queue| if new values are signaled.
+// This semaphore is meant to be used together with pending queue actions; when
+// new values are signaled, the semaphore advances every DWQ in |work_queues|.
+// Multiple DWQs are passed because a single semaphore may gate work on any of
+// the device's queue_affinity bits — if we only notified the queue bound at
+// creation time, actions parked on another DWQ would stay pending forever.
 //
 // Thread-safe; multiple threads may signal/wait values on the same semaphore.
 iree_status_t iree_hal_cuda_event_semaphore_create(
     uint64_t initial_value, const iree_hal_cuda_dynamic_symbols_t* symbols,
     iree_hal_cuda_timepoint_pool_t* timepoint_pool,
-    iree_hal_deferred_work_queue_t* work_queue, iree_allocator_t host_allocator,
+    iree_hal_deferred_work_queue_t* const* work_queues,
+    iree_host_size_t work_queue_count, iree_allocator_t host_allocator,
     iree_hal_semaphore_t** out_semaphore);
 
 // Acquires a timepoint to signal the timeline to the given |to_value| from the
